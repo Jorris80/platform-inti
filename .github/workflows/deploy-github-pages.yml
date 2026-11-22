@@ -1,0 +1,66 @@
+# Opsi B: deploy otomatis ke GitHub Pages setiap push ke branch main.
+# (Bila memakai Cloudflare Pages, workflow ini boleh dihapus.)
+#
+# Syarat:
+#   1. Repo → Settings → Pages → Source: "GitHub Actions"
+#   2. Repo → Settings → Secrets and variables → Actions → New repository secret:
+#        VITE_SUPABASE_URL  dan  VITE_SUPABASE_KEY  (kunci publik)
+name: Deploy ke GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths: ['web/**', '.github/workflows/deploy-github-pages.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Periksa kunci Supabase (GitHub Secrets)
+        env:
+          URL: ${{ secrets.VITE_SUPABASE_URL }}
+          KEY: ${{ secrets.VITE_SUPABASE_KEY }}
+        run: |
+          fail=0
+          if [ -z "$URL" ]; then echo "::error::Secret VITE_SUPABASE_URL belum diisi (Settings > Secrets and variables > Actions > tab Secrets)."; fail=1; fi
+          if [ -z "$KEY" ]; then echo "::error::Secret VITE_SUPABASE_KEY belum diisi (Settings > Secrets and variables > Actions > tab Secrets)."; fail=1; fi
+          if [ -n "$URL" ] && ! echo "$URL" | grep -Eq '^https://[a-z0-9]+\.supabase\.co/?([a-z]+/v1/?)?$'; then
+            echo "::warning::VITE_SUPABASE_URL tidak berbentuk https://xxxx.supabase.co — aplikasi akan mencoba merapikannya otomatis."; fi
+          case "$KEY" in sb_secret_*) echo "::error::VITE_SUPABASE_KEY berisi SECRET key. Ganti dengan publishable/anon key."; fail=1;; esac
+          exit $fail
+      - run: npm install --no-audit --no-fund
+      - run: npm run check
+      - run: npm run build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_KEY: ${{ secrets.VITE_SUPABASE_KEY }}
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: web/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
