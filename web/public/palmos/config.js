@@ -5,6 +5,6 @@
  * JANGAN PERNAH memakai "secret key" / "service_role" di sini.
  */
 window.PALMOS_SUPABASE = {
-  url: 'https://GANTI.supabase.co',
-  key: 'GANTI_DENGAN_PUBLISHABLE_KEY'
+  url: 'https://ohsjwictsgajchffrcmu.supabase.co',
+  key: 'sb_publishable_gFa3_HtMPLo8EyaYZE9fAw_MKxLDUSf'
 };
