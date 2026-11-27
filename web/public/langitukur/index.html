@@ -2280,7 +2280,7 @@ HANDLERS.demoSeed = function (p, s) {
  * ========================================================================== */
 (function (G) {
 'use strict';
-var E = G.SUPA_ENGINE = { store: {}, sess: null, who: null, perms: {}, stage: '2a', org: null, loaded: false };
+var E = G.SUPA_ENGINE = { store: {}, sess: null, who: null, perms: {}, stage: '2a', org: null, loaded: false, secrets: {}, fetchList: [], fetchIdx: 0, need: null };
 
 /* ---------- konversi baris Supabase → bentuk baris versi GAS ---------- */
 var DT = {}; Object.keys(SCHEMA).forEach(function (t) { DT[t] = {}; SCHEMA[t].fields.forEach(function (f) { if (f.t === 'datetime') DT[t][f.k] = 1; }); DT[t].created_at = DT[t].updated_at = 1; });
@@ -2318,7 +2318,7 @@ E.setData = function (o) {
   if (orgs.length) { orgs[0].id = org; orgs[0].org_id = org; if (!orgs[0].name) orgs[0].name = o.who.org.name; E.store.organizations = [orgs[0]]; }
   else E.store.organizations = [{ id: org, org_id: org, name: o.who.org.name, status: 'ACTIVE', deleted: false, version: 1 }];
   // pengaturan & branding: dibaca semua anggota (seperti bootstrap GAS)
-  E.store.settings = (o.settings || []).map(function (s) { return E.toGas('settings', { org_id: org, id: s.id, key: s.key, value: s.value, updated_at: s.updated_at, deleted: false, version: 1 }); });
+  E.store.settings = (o.settings || []).map(function (s) { return E.toGas('settings', Object.assign({ org_id: org, deleted: false, version: 1 }, s)); });
   // nama pengguna untuk tampilan (tanpa email/telepon bila tidak berhak)
   var have = {}; E.store.users.forEach(function (u) { have[u.id] = 1; });
   (o.directory || []).forEach(function (u) { if (!have[u.id]) { have[u.id] = 1; E.store.users.push(E.toGas('users', { org_id: org, id: u.id, full_name: u.full_name, role: u.role, is_active: u.is_active, deleted: false, version: 1 })); } });
@@ -2386,7 +2386,23 @@ G.licenseStatus_ = function () { return MEMO.lic || (MEMO.lic = E.license()); };
 G.can_ = function (s, mod, act) { if (E.stage === '2a' && act !== 'v') return false; return String(E.perms[mod] || '').indexOf(act) >= 0; };
 G.rateLimit_ = function () { };
 G.audit_ = function () { if (E.stage === '2a') return; return ORIG.audit_.apply(null, arguments); };
-G.secretStatus_ = function () { return null; };
+G.secretStatus_ = function () { if (E.stage === '2a' || E.stage === '2b') return null; var o = {}; Object.keys(SECRET_NAMES).forEach(function (k) { o[k] = E.secrets[k] || ''; }); return o; };
+/* kunci rahasia tidak pernah ada di browser: yang dipakai kode .gs hanya penanda __SECRET:NAMA__,
+   diganti nilai asli oleh Edge Function langitukur-proxy di server */
+var PLAIN = { AI_PROVIDER: 1, AI_MODEL: 1, NOTIFY_EMAIL_FROM_NAME: 1 };
+E.prop = function (k) {
+  if (k === 'DEFAULT_ORG') return E.org;
+  if (PLAIN[k]) return E.secrets[k] || null;
+  if (SECRET_NAMES[k]) return E.secrets[k] ? '__SECRET:' + k + '__' : null;
+  return null;
+};
+G.props_ = function () { return { getProperty: E.prop, setProperty: function () { }, deleteProperty: function () { }, getProperties: function () { return {}; } }; };
+/* UrlFetchApp: panggilan pertama dicatat (NEED_FETCH), dijalankan async oleh supa-api, lalu aksi diulang
+   dengan jawaban yang sudah tersedia — urutan panggilan dalam satu aksi selalu sama */
+G.UrlFetchApp = { fetch: function (url, opt) {
+  if (E.fetchIdx < E.fetchList.length) { var r = E.fetchList[E.fetchIdx++]; return { getResponseCode: function () { return r.code; }, getContentText: function () { return r.body; } }; }
+  E.need = { url: url, opt: opt || {} }; var e = new Error('NEED_FETCH'); e.code = 'NEED_FETCH'; throw e;
+} };
 G.capacity_ = function () { return { used: 0, limit: CFG.CELL_LIMIT, pct: 0, warn: false, sheets: [] }; };
 })(window);
 
@@ -2406,17 +2422,24 @@ G.capacity_ = function () { return { used: 0, limit: CFG.CELL_LIMIT, pct: 0, war
  *  - Tahap 2b: aksi simpan/ubah/hapus/ajukan/setujui/RAB/QC/laporan/sinkron offline dijalankan mesin yang sama;
  *    semua perubahannya dikirim SEKALIGUS ke lu_apply (satu transaksi; izin, cakupan proyek, status persetujuan
  *    & konflik versi diperiksa database). File diunggah ke Supabase Storage (bucket langitukur).
- *  - Pengguna, profil/password, pengaturan, AI, PDF/XLSX & lisensi di Tahap 2c.
+ *  - Tahap 2c: pengguna & role, profil & password (Supabase Auth), pengaturan & branding, kunci rahasia
+ *    (tabel lu_secrets), Asisten AI, cuaca & WhatsApp lewat Edge Function langitukur-proxy, XLSX & backup di browser.
+ *  - MFA & PWA penuh di Tahap 3.
  * ========================================================================== */
 (function (G) {
 'use strict';
-var STAGE = '2b', BUILD = '2b-1', E = G.SUPA_ENGINE, C = G.LU_SUPA_CONFIG || {};
+var STAGE = '2c', BUILD = '2c-1', E = G.SUPA_ENGINE, C = G.LU_SUPA_CONFIG || {};
 var sb = null, WHO = null, loadedAt = 0, since = null, loading = null, lastErr = null;
 var REFRESH_MS = 60000, PAGE = 1000, PAR = 6;
 var LOCK = Promise.resolve();
 function serial(fn) { var p = LOCK.then(fn, fn); LOCK = p.catch(function () { }); return p; }
-var LATER = { exportXlsx: '2c', reportPdf: '2c', backupNow: '2c', restore: '2c', weather: '2c', mfaSetup: '3', mfaEnable: '3', mfaDisable: '3', aiAsk: '2c', maintenance: '2c', licenseActivate: '2c', secretSave: '2c',
-  userCreate: '2c', resetPassword: '2c', profileSave: '2c', changePassword: '2c', settingsSave: '2c', demoSeed: '-' };
+var LATER = { mfaSetup: '3', mfaEnable: '3', mfaDisable: '3' };
+var NA = {
+  maintenance: 'Tidak diperlukan di edisi Supabase (tidak ada batas 10 juta sel).',
+  restore: 'Pemulihan di edisi Supabase memakai Supabase → Database → Backups (otomatis harian pada paket berbayar), atau impor ulang dengan 09_PindahSupabase.gs.',
+  licenseActivate: 'Lisensi edisi Supabase dikelola di Platform Inti (menu Lisensi), bukan dengan kunci di sini.',
+  reportPdf: 'Gunakan tombol "Cetak / PDF" lalu pilih "Simpan sebagai PDF".', demoSeed: 'Tidak tersedia.' };
+var FN = 'langitukur-proxy';
 
 function fail(msg, code) { return { ok: false, error: msg, code: code || 'ERR' }; }
 function ok(data) { return { ok: true, data: data }; }
@@ -2475,11 +2498,12 @@ function loadAll() {
     progress('Memuat data… 0/' + tabs.length);
     return Promise.all([
       pool(tabs, PAR, function (t) { return fetchTable(t, org).then(function (r) { progress('Memuat data… ' + (++done) + '/' + tabs.length); return r; }); }),
-      rpcSb('lu_settings_all', { p_org: org }), rpcSb('lu_directory', { p_org: org }), rpcSb('lu_fin', { p_org: org })
+      rpcSb('lu_settings_all', { p_org: org }), rpcSb('lu_directory', { p_org: org }), rpcSb('lu_fin', { p_org: org }),
+      rpcSb('lu_secret_status', { p_org: org }).catch(function () { return {}; })
     ]).then(function (res) {
       var tables = {}; tabs.forEach(function (t, i) { tables[t] = res[0][i]; });
       E.stage = STAGE;
-      E.setData({ who: w, tables: tables, settings: res[1], directory: res[2], fin: res[3] });
+      E.setData({ who: w, tables: tables, settings: res[1], directory: res[2], fin: res[3] }); E.secrets = res[4] || {};
       since = w.server_time; loadedAt = Date.now(); loading = null;
       try { var b = (E.store.settings.filter(function (s) { return s.key === 'branding'; })[0] || {}).value; if (b) localStorage.setItem('lu.supa.brand', b); } catch (e) { }
       G.LU_SUPA.lastLoadMs = Date.now() - t0;
@@ -2494,7 +2518,7 @@ function refresh() {
   return rpcSb('lu_changes', { p_org: E.org, p_since: since, p_limit: 5000 }).then(function (ch) {
     var finTouched = false;
     Object.keys(ch).forEach(function (t) { if (t === 'server_time' || !SCHEMA[t] || !ch[t].length) return; if (t === 'settings') return; E.merge(t, ch[t]); if (E.finCols(t).length) finTouched = true; });
-    if ((ch.settings || []).length) return rpcSb('lu_settings_all', { p_org: E.org }).then(function (s) { E.store.settings = s.map(function (x) { return E.toGas('settings', { org_id: E.org, id: x.id, key: x.key, value: x.value, updated_at: x.updated_at, deleted: false, version: 1 }); }); return [ch, finTouched]; });
+    if ((ch.settings || []).length) return rpcSb('lu_settings_all', { p_org: E.org }).then(function (s) { E.store.settings = s.map(function (x) { return E.toGas('settings', Object.assign({ org_id: E.org, deleted: false }, x)); }); return [ch, finTouched]; });
     return [ch, finTouched];
   }).then(function (x) {
     since = x[0].server_time; loadedAt = Date.now();
@@ -2534,6 +2558,7 @@ function call(action, payload, token) {
   }
   if (action === 'logout') { E.clear(); loadedAt = 0; return client().auth.signOut().then(function () { return ok({ ok: true }); }, function () { return ok({ ok: true }); }); }
   if (LATER[action]) return Promise.resolve(fail('Fitur ini aktif di Tahap ' + LATER[action] + ' edisi Supabase.', 'READONLY'));
+  if (NA[action]) return Promise.resolve(fail(NA[action], 'NA'));
   var isWrite = !!(G.WRITE_ACTIONS && G.WRITE_ACTIONS[action]) || action === 'upload';
   return session().then(function (s) {
     if (!s) { E.clear(); return fail('Sesi berakhir. Silakan login kembali.', 'AUTH'); }
@@ -2542,6 +2567,7 @@ function call(action, payload, token) {
     return p.then(function () {
       if (action === 'capacity') return rpcSb('lu_capacity', { p_org: E.org }).then(function (c) { return ok({ supabase: true, used: c.db_bytes, limit: c.db_limit, pct: Math.round(c.db_bytes / c.db_limit * 10000) / 100, warn: c.db_bytes / c.db_limit > 0.8, rows: c.rows, sheets: c.tables.map(function (x) { return { sheet: x.sheet, cells: x.rows, rows: x.rows }; }) }); });
       if (action === 'upload') return upload(payload);
+      if (SPECIAL[action]) return serial(function () { return SPECIAL[action](payload); });
       if (action === 'sync') return serial(function () { return syncOps(payload.ops || []); });
       return isWrite ? serial(function () { return runWrite(action, payload, true); }) : runWrite(action, payload, false);
     });
@@ -2549,13 +2575,23 @@ function call(action, payload, token) {
 }
 
 /* ---------- menjalankan aksi + mengirim perubahannya ke lu_apply ---------- */
-function runWrite(action, payload, strict) {
+function runWrite(action, payload, strict, tries) {
+  tries = tries || 0;
+  if (!tries) { E.fetchList = []; }
+  E.fetchIdx = 0; E.need = null;
   E.begin(); var out = runGas(action, payload), cap = E.end();
+  if (!out.ok && out.code === 'NEED_FETCH' && E.need && tries < 4) {
+    E.rollback(cap); var need = E.need;
+    return remoteFetch(need).then(function (r) { E.fetchList.push(r); return runWrite(action, payload, strict, tries + 1); }, function (e) { E.fetchList = []; return fail(e.message, 'FETCH'); });
+  }
+  E.fetchList = [];
   if (!out.ok) { E.rollback(cap); return Promise.resolve(out); }
   var ops = E.collapse(cap.ops);
   if (!ops.length) return Promise.resolve(out);
   return rpcSb('lu_apply', { p_org: E.org, p_action: action, p_ops: ops }).then(function (r) {
-    E.ack(r.rows); return out;
+    E.ack(r.rows);
+    if (ops.some(function (o) { return o.t === 'notifications' && o.k === 'ins'; }) && E.secrets.FONNTE_TOKEN) edge('waDispatch', {}).catch(function () { });
+    return out;
   }, function (err) {
     E.rollback(cap);
     if (!strict) return out;                       // aksi baca: catatan audit boleh gagal
@@ -2613,13 +2649,92 @@ function upload(p) {
     });
   });
 }
+/* ---------- Edge Function langitukur-proxy ---------- */
+function edge(action, body) {
+  return client().functions.invoke(FN, { body: Object.assign({ action: action, org: E.org }, body || {}) }).then(function (r) {
+    if (!r.error) { if (r.data && r.data.ok === false) throw new Error(r.data.error); return r.data && r.data.data; }
+    var ctx = r.error.context;
+    if (ctx && typeof ctx.json === 'function' && ctx.status !== 404) return ctx.json().then(function (j) { throw new Error((j && (j.error || j.message)) || r.error.message); }, function () { throw new Error(r.error.message); });
+    throw new Error('Edge Function ' + FN + ' belum dipasang di Supabase atau tidak bisa dihubungi (Langkah 2 panduan Tahap 2c).');
+  });
+}
+/* UrlFetchApp dari kode .gs: cuaca tanpa kunci langsung dari browser; yang lain lewat Edge Function */
+function remoteFetch(need) {
+  var o = need.opt || {}, hasSecret = /__SECRET:/.test(need.url + JSON.stringify(o.headers || {}) + JSON.stringify(o.payload || ''));
+  if (/^https:\/\/api\.open-meteo\.com\//.test(need.url) && !hasSecret) {
+    return fetch(need.url).then(function (r) { return r.text().then(function (t) { return { code: r.status, body: t }; }); });
+  }
+  return edge('fetch', { req: { url: need.url, method: o.method || 'get', headers: o.headers || {}, payload: o.payload === undefined ? null : o.payload, contentType: o.contentType || null } });
+}
+function download(blob, name) { var u = URL.createObjectURL(blob); var a = document.createElement('a'); a.href = u; a.download = name; document.body.appendChild(a); a.click(); setTimeout(function () { a.remove(); }, 500); return u; }
+function xesc(v) { return String(v == null ? '' : v).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ''); }
+function colName(i) { var s = ''; i++; while (i > 0) { var m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; }
+/* XLSX sederhana (tanpa pustaka luar): baris judul tebal & dibekukan, angka tetap angka */
+function xlsx(cols, rows, title) {
+  var sheet = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetData>' +
+    [cols].concat(rows.map(function (r) { return cols.map(function (c) { return r[c]; }); })).map(function (row, ri) {
+      return '<row r="' + (ri + 1) + '">' + row.map(function (v, ci) {
+        var ref = colName(ci) + (ri + 1);
+        if (ri > 0 && typeof v === 'number' && isFinite(v)) return '<c r="' + ref + '"><v>' + v + '</v></c>';
+        if (ri > 0 && typeof v === 'boolean') return '<c r="' + ref + '" t="b"><v>' + (v ? 1 : 0) + '</v></c>';
+        return '<c r="' + ref + '" t="inlineStr"' + (ri === 0 ? ' s="1"' : '') + '><is><t xml:space="preserve">' + xesc(v).slice(0, 32000) + '</t></is></c>';
+      }).join('') + '</row>';
+    }).join('') + '</sheetData></worksheet>';
+  var X = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+  return LU.zipStore([
+    { name: '[Content_Types].xml', data: X + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>' },
+    { name: '_rels/.rels', data: X + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>' },
+    { name: 'xl/workbook.xml', data: X + '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="' + xesc(String(title).slice(0, 31).replace(/[\\\/?*\[\]:]/g, ' ')) + '" sheetId="1" r:id="rId1"/></sheets></workbook>' },
+    { name: 'xl/_rels/workbook.xml.rels', data: X + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>' },
+    { name: 'xl/styles.xml', data: X + '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="2"><xf/><xf fontId="1" applyFont="1"/></cellXfs></styleSheet>' },
+    { name: 'xl/worksheets/sheet1.xml', data: sheet }
+  ]);
+}
+/* aksi yang di edisi Supabase dikerjakan berbeda dari versi GAS */
+var SPECIAL = {
+  secretSave: function (p) {
+    if (['SUPER_ADMIN', 'ORG_ADMIN'].indexOf(E.sess.role) < 0) return fail('Hanya admin.', 'FORBIDDEN');
+    return rpcSb('lu_secret_set', { p_org: E.org, p_name: p.name, p_value: p.value || '' }).then(function (st) { E.secrets = st || {}; return ok(G.secretStatus_()); }, mapErr);
+  },
+  userCreate: function (p) {
+    return edge('createUser', { user: { email: p.email, password: p.password || '', full_name: p.full_name, phone: p.phone, role: p.role, position: p.position } }).then(function (r) {
+      loadedAt = 1; return refresh().then(function () { return ok({ record: E.row('users', r.id), invited: r.invited, account: r.account }); });
+    }, function (e) { return fail(e.message); });
+  },
+  resetPassword: function (p) {
+    var u = E.row('users', p.user_id); if (!u || !u.email) return fail('Pengguna tidak ditemukan.');
+    return edge('resetPassword', { email: u.email, redirect: location.origin + location.pathname }).then(function () { return ok({ ok: true, emailed: u.email }); }, function (e) { return fail(e.message); });
+  },
+  changePassword: function (p) {
+    var em = E.sess.email, np = String(p.new_password || '');
+    if (np.length < 8 || !/[A-Za-z]/.test(np) || !/\d/.test(np)) return fail('Password minimal 8 karakter, berisi huruf dan angka.');
+    return client().auth.signInWithPassword({ email: em, password: String(p.old_password || '') }).then(function (r) {
+      if (r.error) return fail('Password lama salah.', 'AUTH_FAIL');
+      return client().auth.updateUser({ password: np }).then(function (x) { if (x.error) return fail(x.error.message); return ok({ ok: true }); });
+    });
+  },
+  exportXlsx: function (p) {
+    var out = runGas('list', { table: p.table, project_id: p.project_id }); if (!out.ok) return out;
+    var hid = SCHEMA[p.table].hidden || [], cols = G.colsOf_(p.table).filter(function (c) { return hid.indexOf(c) < 0; });
+    var name = p.table + '_' + new Date().toISOString().slice(0, 10) + '.xlsx', url = download(xlsx(cols, out.data.rows, SCHEMA[p.table].title), name);
+    return ok({ rows: out.data.rows.length, xlsx: url, name: name, local: true });
+  },
+  backupNow: function () {
+    if (String(E.perms.settings || '').indexOf('u') < 0) return fail('Akses ditolak: Pengaturan (ubah).', 'FORBIDDEN');
+    var data = { app: APP_META, edition: 'supabase', org: E.who.org, at: new Date().toISOString(), tables: {} };
+    Object.keys(SCHEMA).forEach(function (t) { data.tables[t] = (E.store[t] || []).map(function (r) { var o = {}; for (var k in r) if (k !== '_row') o[k] = r[k]; return o; }); });
+    var name = 'LangitUkur-backup-' + new Date().toISOString().slice(0, 16).replace(/[:T]/g, '') + '.json';
+    return ok({ name: name, url: download(new Blob([JSON.stringify(data)], { type: 'application/json' }), name), local: true });
+  }
+};
+
 function signedUrl(ref) {
   var m = String(ref || '').match(/^sb:\/\/([^/]+)\/(.+)$/); if (!m) return Promise.resolve(ref);
   return client().storage.from(m[1]).createSignedUrl(m[2], 3600).then(function (r) { if (r.error) throw new Error('File tidak bisa dibuka: ' + r.error.message); return r.data.signedUrl; });
 }
 
 G.LU_SUPA = {
-  call: call, stage: STAGE, build: BUILD, signedUrl: signedUrl,
+  call: call, stage: STAGE, build: BUILD, signedUrl: signedUrl, edge: edge,
   hasSession: function () { try { client(); } catch (e) { return Promise.resolve(false); } return session().then(function (s) { return !!s; }, function () { return false; }); },
   configError: cfgError,
   reload: function () { loadedAt = 0; E.loaded = false; return loadAll(); },
@@ -2684,7 +2799,7 @@ Object.assign(LU, { $: $, $$: $$, esc: esc, num: num, rp: rp, dt: dt, chip: chip
 /* ---------------- Toast & progress ---------------- */
 function toast(msg, type) { var w = $('#toast'); if (!w) return; var d = document.createElement('div'); d.className = type || ''; d.textContent = msg; w.appendChild(d); setTimeout(function () { d.remove(); }, type === 'e' ? 5200 : 2800); }
 var busyN = 0; function busy(on) { busyN += on ? 1 : -1; if (busyN < 0) busyN = 0; var p = $('#pbar'); if (!p) return; if (busyN) { p.style.opacity = 1; p.style.width = '70%'; } else { p.style.width = '100%'; setTimeout(function () { if (!busyN) { p.style.opacity = 0; p.style.width = 0; } }, 250); } }
-LU.toast = toast; LU.busy = busy;
+LU.toast = toast; LU.busy = busy; LU.MODE = MODE;
 LU.openFile = function (u) { u = String(u || '').trim(); if (!u) return toast('Belum ada file.'); if (/^sb:\/\//.test(u)) { var w = window.open('', '_blank'); return window.LU_SUPA.signedUrl(u).then(function (x) { if (w) w.location = x; else location.href = x; }).catch(function (e) { if (w) w.close(); toast(e.message, 'e'); }); } if (!/^https?:\/\//.test(u)) return toast('Tautan tidak dikenali.', 'e'); window.open(u, '_blank', 'noopener'); };
 
 /* ---------------- IndexedDB mini ---------------- */
@@ -3133,7 +3248,7 @@ LU.V.table = function (main, p) {
   if ($('#aoiimp')) $('#aoiimp').onclick = function () { LU.importAoi(function () { load(true); }); };
   if ($('#imp')) $('#imp').onclick = function () { LU.importCsv(t, function () { load(true); }); };
   $('#csv').onclick = function () { download(t + '_' + LU.today() + '.csv', '\uFEFF' + CALC.csvOf(rows, cols.concat(T.fields.map(function (f) { return f.k; }).filter(function (k) { return cols.indexOf(k) < 0 && !fieldOf(t, k).sys; })).concat(['id', 'updated_at'])), 'text/csv'); };
-  $('#xls').onclick = function () { rpc('exportXlsx', { table: t, project_id: S.pid }).then(function (r) { LU.modal({ title: 'Ekspor siap', body: '<p>' + r.rows + ' baris diekspor ke Google Drive (folder LangitUkur/Ekspor).</p><p><a class="btn p" target="_blank" rel="noopener" href="' + esc(r.xlsx) + '">' + ic('dl') + 'Unduh .xlsx</a> <a class="btn" target="_blank" rel="noopener" href="' + esc(r.url) + '">Buka di Google Sheets</a></p>' }); }).catch(function (e) { toast(e.message, 'e'); }); };
+  $('#xls').onclick = function () { rpc('exportXlsx', { table: t, project_id: S.pid }).then(function (r) { LU.modal({ title: 'Ekspor siap', body: r.local ? '<p>' + r.rows + ' baris diekspor ke berkas <b>' + esc(r.name) + '</b> (sudah diunduh ke perangkat).</p><p><a class="btn p" download="' + esc(r.name) + '" href="' + esc(r.xlsx) + '">' + ic('dl') + 'Unduh lagi</a></p>' : '<p>' + r.rows + ' baris diekspor ke Google Drive (folder LangitUkur/Ekspor).</p><p><a class="btn p" target="_blank" rel="noopener" href="' + esc(r.xlsx) + '">' + ic('dl') + 'Unduh .xlsx</a> <a class="btn" target="_blank" rel="noopener" href="' + esc(r.url) + '">Buka di Google Sheets</a></p>' }); }).catch(function (e) { toast(e.message, 'e'); }); };
   LU._reloadTable = function () { load(true); };
   return load(false);
 };
@@ -3236,15 +3351,16 @@ function extraActions(t, r, isNew) {
   if (t === 'processing_jobs') a.push({ label: 'Buka job', icon: 'cpu', fn: function (c) { c(); LU.go('processing', { id: r.id }); } });
   if (t === 'handovers' && r.status !== 'APPROVED' && LU.can('handover', 'u')) a.push({ label: 'Susun paket', icon: 'box', fn: function (c) { rpc('handoverBuild', { handover_id: r.id }).then(function (x) { LU.modal({ title: 'Paket serah terima', body: '<p><b>' + x.files + '</b> file masuk paket.</p>' + (x.gaps.length ? '<h4>Kekurangan</h4>' + x.gaps.map(function (g) { return '<div class="al warn">' + esc(g) + '</div>'; }).join('') : '<div class="al ok">Lengkap.</div>') }); LU.invalidate('handovers'); LU._reloadTable && LU._reloadTable(); }).catch(function (e) { toast(e.message, 'e'); }); } });
   if (t === 'handovers' && r.file_list) a.push({ label: 'Daftar file', icon: 'list', fn: function () { var fl = {}; try { fl = JSON.parse(r.file_list); } catch (e) { } LU.modal({ title: 'Daftar file serah terima', wide: true, body: '<div class="tw"><table class="t"><tr><th>Jenis</th><th>Nama</th><th>Versi</th><th>Tanggal</th><th>Ukuran</th><th>Checksum</th><th>Status</th></tr>' + (fl.files || []).map(function (f) { return '<tr><td>' + esc(f.kind) + '</td><td>' + (/^https?:/.test(f.uri) ? '<a target="_blank" rel="noopener" href="' + esc(f.uri) + '">' + esc(f.name) + '</a>' : esc(f.name)) + '</td><td>' + esc(f.version) + '</td><td>' + esc(f.date) + '</td><td>' + num(f.size, 0) + '</td><td class="sm">' + esc(String(f.checksum || '-').slice(0, 16)) + '</td><td>' + chip(f.status) + '</td></tr>'; }).join('') + '</table></div>' + (fl.gaps || []).map(function (g) { return '<div class="al warn mt">' + esc(g) + '</div>'; }).join('') }); } });
-  if (t === 'users' && LU.can('users', 'u')) a.push({ label: 'Reset password', icon: 'key', fn: function () { LU.prompt('Reset password', 'Password baru (min 8, huruf & angka)').then(function (v) { if (v) rpc('resetPassword', { user_id: r.id, password: v }).then(function () { toast('Password direset', 's'); }).catch(function (e) { toast(e.message, 'e'); }); }); } });
+  if (t === 'users' && LU.can('users', 'u') && LU.MODE === 'supa') a.push({ label: 'Kirim tautan reset password', icon: 'key', fn: function () { LU.confirm('Kirim tautan reset password ke ' + (r.email || 'email pengguna') + '? Pengguna membuat password baru sendiri dari email itu.', 'Kirim').then(function (y) { if (y) rpc('resetPassword', { user_id: r.id }).then(function (x) { toast('Tautan reset dikirim ke ' + x.emailed, 's'); }).catch(function (e) { toast(e.message, 'e'); }); }); } });
+  else if (t === 'users' && LU.can('users', 'u')) a.push({ label: 'Reset password', icon: 'key', fn: function () { LU.prompt('Reset password', 'Password baru (min 8, huruf & angka)').then(function (v) { if (v) rpc('resetPassword', { user_id: r.id, password: v }).then(function () { toast('Password direset', 's'); }).catch(function (e) { toast(e.message, 'e'); }); }); } });
   if (t === 'images' && r.lat) a.push({ label: 'Peta', icon: 'map', fn: function (c) { c(); LU.go('map', { focus: 'img:' + r.id }); } });
   if (t === 'output_assets' && r.tile_url) a.push({ label: 'Tampilkan di peta', icon: 'map', fn: function (c) { c(); LU.go('map', { focus: 'asset:' + r.id }); } });
   return a;
 }
 LU.history = function (t, id) { LU.load('audit_logs').then(function (rows) { var h = rows.filter(function (x) { return x.entity === t && x.entity_id === id; }); LU.modal({ title: 'Riwayat perubahan', body: h.length ? h.map(function (x) { return '<div class="al info"><div><b>' + esc(x.action) + '</b> · ' + dt(x.ts) + ' · ' + esc(x.user_email) + '<div class="sm" style="word-break:break-all">' + esc(x.detail) + '</div></div></div>'; }).join('') : '<p class="muted">Belum ada riwayat.</p>' }); }); };
 LU.userAdd = function () {
-  LU.modal({ title: 'Tambah pengguna', body: '<form id="uf" class="fg"><label class="f"><span>Nama lengkap <em>*</em></span><input class="inp" name="full_name" required></label><label class="f"><span>Email <em>*</em></span><input class="inp" type="email" name="email" required></label><label class="f"><span>No. WhatsApp</span><input class="inp" name="phone"></label><label class="f"><span>Jabatan</span><input class="inp" name="position"></label><label class="f"><span>Peran <em>*</em></span><select class="inp" name="role" required>' + Object.keys(ROLES).filter(function (k) { return k !== 'SUPER_ADMIN' || S.boot.user.role === 'SUPER_ADMIN'; }).map(function (k) { return '<option value="' + k + '">' + esc(ROLES[k]) + '</option>'; }).join('') + '</select></label><label class="f"><span>Password awal <em>*</em></span><input class="inp" name="password" required minlength="8"></label></form><p class="sm muted">Sampaikan password awal secara aman; minta pengguna mengganti di menu Profil.</p>',
-    actions: [{ label: 'Simpan', cls: 'p', fn: function (c, w) { var f = $('#uf', w); if (!f.reportValidity()) return; rpc('userCreate', Object.fromEntries(new FormData(f).entries())).then(function () { toast('Pengguna ditambahkan', 's'); c(); LU.reboot(); }).catch(function (e) { toast(e.message, 'e'); }); } }] });
+  LU.modal({ title: 'Tambah pengguna', body: '<form id="uf" class="fg"><label class="f"><span>Nama lengkap <em>*</em></span><input class="inp" name="full_name" required></label><label class="f"><span>Email <em>*</em></span><input class="inp" type="email" name="email" required></label><label class="f"><span>No. WhatsApp</span><input class="inp" name="phone"></label><label class="f"><span>Jabatan</span><input class="inp" name="position"></label><label class="f"><span>Peran <em>*</em></span><select class="inp" name="role" required>' + Object.keys(ROLES).filter(function (k) { return k !== 'SUPER_ADMIN' || S.boot.user.role === 'SUPER_ADMIN'; }).map(function (k) { return '<option value="' + k + '">' + esc(ROLES[k]) + '</option>'; }).join('') + '</select></label>' + (LU.MODE === 'supa' ? '<label class="f"><span>Password awal (opsional)</span><input class="inp" name="password" minlength="8" placeholder="kosongkan = undangan"></label></form><div class="al info mt"><div>Diisi: akun Platform Inti langsung dibuat (beri tahu password-nya ke orang itu). Dikosongkan: orang itu mendaftar sendiri di Platform Inti dengan email ini, lalu Owner menambahkannya sebagai Anggota — role-nya otomatis aktif.</div></div>' : '<label class="f"><span>Password awal <em>*</em></span><input class="inp" name="password" required minlength="8"></label></form>') + '<p class="sm muted">Sampaikan password awal secara aman; minta pengguna mengganti di menu Profil.</p>',
+    actions: [{ label: 'Simpan', cls: 'p', fn: function (c, w) { var f = $('#uf', w); if (!f.reportValidity()) return; rpc('userCreate', Object.fromEntries(new FormData(f).entries())).then(function (x) { toast(x && x.invited ? 'Undangan tersimpan — aktif setelah orang itu menjadi Anggota di Platform Inti' : 'Pengguna ditambahkan', 's'); c(); LU.reboot(); }).catch(function (e) { toast(e.message, 'e'); }); } }] });
 };
 LU.pickUpload = function (pid, folder) {
   return new Promise(function (res) {
@@ -3417,7 +3533,7 @@ LU.V.reports = function (main, p) {
       if (r.status !== 'APPROVED' && LU.can('reports', 'u')) acts.push({ label: 'Edit narasi', icon: 'edit', fn: function (c) { c(); LU._after = function () { LU.invalidate(t); load(); }; LU.edit(t, r); } });
       if (r.status !== 'APPROVED' && LU.can('ai') && LU.can('reports', 'u')) acts.push({ label: 'Draf narasi AI', icon: 'ai', fn: function (c) { var mode = ty === 'daily' ? 'daily_narrative' : ty === 'final' ? 'final_narrative' : 'monthly_narrative'; rpc('aiAsk', { project_id: S.pid, mode: mode, question: 'Susun narasi untuk laporan ' + REP[ty][1] + ' periode ' + r.period }).then(function (a) { var nr = a.answer + '\n\n[Draf ' + a.provider + ' — tinjau sebelum diajukan]'; return LU.save(t, { id: r.id, narrative: nr }, r.version).then(function () { c(); toast('Narasi draf disimpan — tinjau lalu ajukan.', 's'); LU.invalidate(t); load(); }); }).catch(function (e) { toast(e.message, 'e'); }); } });
       if (['DRAFT', 'REJECTED'].indexOf(r.status) >= 0) acts.push({ label: 'Ajukan', icon: 'check', fn: function (c) { rpc('submitApproval', { table: t, id: r.id }).then(function () { c(); toast('Diajukan', 's'); load(); }).catch(function (e) { toast(e.message, 'e'); }); } });
-      acts.push({ label: 'Simpan PDF ke Drive', icon: 'dl', fn: function () { rpc('reportPdf', { table: t, id: r.id }).then(function (f) { LU.modal({ title: 'PDF tersimpan', body: '<p>' + esc(f.name) + '</p><a class="btn p" target="_blank" rel="noopener" href="' + esc(f.url) + '">Buka PDF</a>' }); }).catch(function (e) { toast(e.message, 'e'); }); } });
+      if (LU.MODE !== 'supa') acts.push({ label: 'Simpan PDF ke Drive', icon: 'dl', fn: function () { rpc('reportPdf', { table: t, id: r.id }).then(function (f) { LU.modal({ title: 'PDF tersimpan', body: '<p>' + esc(f.name) + '</p><a class="btn p" target="_blank" rel="noopener" href="' + esc(f.url) + '">Buka PDF</a>' }); }).catch(function (e) { toast(e.message, 'e'); }); } });
       acts.push({ label: 'Cetak / PDF', icon: 'print', cls: 'p', fn: function () { var wn = window.open('', '_blank'); if (!wn) return toast('Izinkan pop-up untuk mencetak.', 'e'); wn.document.write(x.html); wn.document.close(); setTimeout(function () { wn.print(); }, 400); } });
       LU.modal({ title: SCHEMA[t].title + ' — ' + r.period + ' v' + r.rep_version, wide: true, body: '<iframe title="Pratinjau laporan" style="width:100%;height:68vh;border:1px solid var(--line);border-radius:10px;background:#fff" sandbox="allow-same-origin allow-modals" id="rf"></iframe>', actions: acts, onOpen: function (w) { $('#rf', w).srcdoc = x.html; } });
     }).catch(function (e) { toast(e.message, 'e'); });
@@ -3508,22 +3624,23 @@ LU.V.settings = function (main, p) {
   }
   if (tab === 'integr') {
     var sc = S.boot.secrets || {};
-    sb.innerHTML = admin ? '<div class="card"><h3>Kunci & token (disimpan di Script Properties, tidak pernah dikirim balik)</h3><div class="tw"><table class="t">' + [['AI_PROVIDER', 'GEMINI / OPENAI / ANTHROPIC'], ['AI_API_KEY', 'Kunci API provider AI'], ['AI_MODEL', 'Nama model sesuai dokumentasi provider'], ['FONNTE_TOKEN', 'Token WhatsApp Fonnte'], ['ADAPTER_TOKEN', 'Token webhook worker fotogrametri'], ['WEATHER_API_KEY', 'Kunci langganan Open-Meteo (komersial)']].map(function (x) { return '<tr><td><b>' + x[0] + '</b><div class="sm muted">' + x[1] + '</div></td><td>' + (sc[x[0]] ? '<span class="chip c-ok">' + esc(sc[x[0]]) + '</span>' : '<span class="chip">kosong</span>') + '</td><td class="right"><button class="btn s" data-sec="' + x[0] + '">Ubah</button></td></tr>'; }).join('') + '</table></div><p class="sm muted mt">Webhook worker: POST ke URL Web App dengan body {"action":"adapterCallback","adapterToken":"…","payload":{"job_code":"JOB-…","status":"RUNNING|COMPLETED|FAILED","log":"…","outputs":[{"asset_type":"ORTHOMOSAIC","format":"COG","crs":"EPSG:32749","uri":"…","checksum":"…"}]}}</p></div>' : '<div class="al warn">Hanya admin.</div>';
+    sb.innerHTML = admin ? '<div class="card"><h3>Kunci & token (' + (LU.MODE === 'supa' ? 'disimpan di database Supabase, tidak bisa dibaca browser' : 'disimpan di Script Properties, tidak pernah dikirim balik') + ')</h3><div class="tw"><table class="t">' + [['AI_PROVIDER', 'GEMINI / OPENAI / ANTHROPIC'], ['AI_API_KEY', 'Kunci API provider AI'], ['AI_MODEL', 'Nama model sesuai dokumentasi provider'], ['FONNTE_TOKEN', 'Token WhatsApp Fonnte'], ['ADAPTER_TOKEN', 'Token webhook worker fotogrametri'], ['WEATHER_API_KEY', 'Kunci langganan Open-Meteo (komersial)']].map(function (x) { return '<tr><td><b>' + x[0] + '</b><div class="sm muted">' + x[1] + '</div></td><td>' + (sc[x[0]] ? '<span class="chip c-ok">' + esc(sc[x[0]]) + '</span>' : '<span class="chip">kosong</span>') + '</td><td class="right"><button class="btn s" data-sec="' + x[0] + '">Ubah</button></td></tr>'; }).join('') + '</table></div>' + (LU.MODE === 'supa' ? '<p class="sm muted mt">Edisi Supabase: kunci dipakai Edge Function <b>langitukur-proxy</b> di server. Webhook worker fotogrametri (ADAPTER_TOKEN) untuk edisi Supabase menyusul di Tahap 3 — sementara status job diperbarui manual.</p>' : '<p class="sm muted mt">Webhook worker: POST ke URL Web App dengan body {"action":"adapterCallback","adapterToken":"…","payload":{"job_code":"JOB-…","status":"RUNNING|COMPLETED|FAILED","log":"…","outputs":[{"asset_type":"ORTHOMOSAIC","format":"COG","crs":"EPSG:32749","uri":"…","checksum":"…"}]}}</p>') + '</div>' : '<div class="al warn">Hanya admin.</div>';
     $$('[data-sec]').forEach(function (bt) { bt.onclick = function () { LU.prompt('Ubah ' + bt.getAttribute('data-sec'), 'Nilai baru (kosongkan untuk menghapus)').then(function (v) { if (v === null) return; rpc('secretSave', { name: bt.getAttribute('data-sec'), value: v }).then(function () { toast('Tersimpan', 's'); LU.reboot(); }).catch(function (e) { toast(e.message, 'e'); }); }); }; });
   }
   if (tab === 'data') {
-    sb.innerHTML = '<div class="grid g2"><div class="card"><h3>Kapasitas Google Sheets</h3><div id="cap"><div class="sk"></div></div>' + (canU ? '<div class="row mt"><button class="btn" id="trim">' + ic('ref') + 'Pangkas sel kosong</button><button class="btn" id="arch">' + ic('box') + 'Arsipkan data terhapus > 90 hari</button></div>' : '') + '<p class="sm muted mt">Batas 10 juta sel/spreadsheet. Teks > 45.000 karakter otomatis dipecah ke sheet _blobs (batas 50.000/sel). File besar (foto mentah, orthomosaic, point cloud) disimpan di Drive/NAS — sistem hanya menyimpan tautan & checksum.</p></div>' +
-      '<div class="card"><h3>Backup & pemulihan</h3><p class="sm muted">Backup otomatis harian ke Drive (LangitUkur/Backup, simpan 14 terakhir).</p>' + (canU ? '<button class="btn p" id="bk">' + ic('dl') + 'Backup sekarang</button>' : '') + (S.boot.user.role === 'SUPER_ADMIN' ? '<div class="mt"><button class="btn d" id="rs">' + ic('ul') + 'Pulihkan dari backup…</button></div>' : '') + '</div></div>';
+    sb.innerHTML = '<div class="grid g2"><div class="card"><h3>Kapasitas Google Sheets</h3><div id="cap"><div class="sk"></div></div>' + (canU && LU.MODE !== 'supa' ? '<div class="row mt"><button class="btn" id="trim">' + ic('ref') + 'Pangkas sel kosong</button><button class="btn" id="arch">' + ic('box') + 'Arsipkan data terhapus > 90 hari</button></div>' : '') + '<p class="sm muted mt">Batas 10 juta sel/spreadsheet. Teks > 45.000 karakter otomatis dipecah ke sheet _blobs (batas 50.000/sel). File besar (foto mentah, orthomosaic, point cloud) disimpan di Drive/NAS — sistem hanya menyimpan tautan & checksum.</p></div>' +
+      '<div class="card"><h3>Backup & pemulihan</h3><p class="sm muted">' + (LU.MODE === 'supa' ? 'Edisi Supabase: database dicadangkan oleh Supabase (Database → Backups). Tombol di bawah mengunduh salinan data organisasi (JSON) ke perangkat.' : 'Backup otomatis harian ke Drive (LangitUkur/Backup, simpan 14 terakhir).') + '</p>' + (canU ? '<button class="btn p" id="bk">' + ic('dl') + 'Backup sekarang</button>' : '') + (S.boot.user.role === 'SUPER_ADMIN' && LU.MODE !== 'supa' ? '<div class="mt"><button class="btn d" id="rs">' + ic('ul') + 'Pulihkan dari backup…</button></div>' : '') + '</div></div>';
     rpc('capacity', {}).then(function (c) { if (c.supabase) { $('#cap').closest('.card').querySelector('h3').textContent = 'Kapasitas database Supabase'; $('#cap').innerHTML = '<div class="row" style="justify-content:space-between"><span>' + num(c.used / 1048576, 1) + ' MB / ' + num(c.limit / 1048576, 0) + ' MB (dipakai bersama semua aplikasi Platform Inti)</span><b>' + num(c.pct, 2) + '%</b></div><div class="bar mt"><i style="width:' + Math.min(100, c.pct) + '%;' + (c.warn ? 'background:var(--bad)' : '') + '"></i></div><div class="tw mt"><table class="t"><tr><th>Tabel</th><th class="right">Baris</th></tr>' + c.sheets.map(function (s) { return '<tr><td>' + esc(s.sheet) + '</td><td class="right">' + num(s.rows, 0) + '</td></tr>'; }).join('') + '</table></div>'; var pn = $('#cap').closest('.card').querySelector('p.sm'); if (pn) pn.textContent = 'Edisi Supabase: tidak ada batas 10 juta sel. Supabase Free memberi 500 MB untuk seluruh proyek; file foto tetap di Drive/penyimpanan terpisah.'; return; } $('#cap').innerHTML = '<div class="row" style="justify-content:space-between"><span>' + num(c.used, 0) + ' / ' + num(c.limit, 0) + ' sel</span><b>' + num(c.pct, 2) + '%</b></div><div class="bar mt"><i style="width:' + Math.min(100, c.pct) + '%;' + (c.warn ? 'background:var(--bad)' : '') + '"></i></div><div class="tw mt"><table class="t"><tr><th>Sheet</th><th class="right">Sel</th><th class="right">Baris terisi</th></tr>' + c.sheets.map(function (s) { return '<tr><td>' + esc(s.sheet) + '</td><td class="right">' + num(s.cells, 0) + '</td><td class="right">' + num(s.rows, 0) + '</td></tr>'; }).join('') + '</table></div>'; }).catch(function (e) { $('#cap').innerHTML = LU.errBox(e); });
     if ($('#trim')) $('#trim').onclick = function () { rpc('maintenance', {}).then(function (r) { toast(num(r.freedCells, 0) + ' sel dibebaskan', 's'); LU.go('settings', { tab: 'data' }, { noPush: true }); }).catch(function (e) { toast(e.message, 'e'); }); };
     if ($('#arch')) $('#arch').onclick = function () { LU.confirm('Pindahkan baris yang dihapus > 90 hari ke spreadsheet arsip?').then(function (y) { if (y) rpc('maintenance', { archive: true, days: 90 }).then(function (r) { toast(r.archived + ' baris diarsipkan', 's'); LU.go('settings', { tab: 'data' }, { noPush: true }); }).catch(function (e) { toast(e.message, 'e'); }); }); };
-    if ($('#bk')) $('#bk').onclick = function () { rpc('backupNow', {}).then(function (r) { LU.modal({ title: 'Backup selesai', body: '<p>' + esc(r.name) + '</p><a class="btn p" target="_blank" rel="noopener" href="' + esc(r.url) + '">Buka di Drive</a>' }); }).catch(function (e) { toast(e.message, 'e'); }); };
+    if ($('#bk')) $('#bk').onclick = function () { rpc('backupNow', {}).then(function (r) { LU.modal({ title: 'Backup selesai', body: '<p>' + esc(r.name) + '</p>' + (r.local ? '<a class="btn p" download="' + esc(r.name) + '" href="' + esc(r.url) + '">' + ic('dl') + 'Unduh lagi</a>' : '<a class="btn p" target="_blank" rel="noopener" href="' + esc(r.url) + '">Buka di Drive</a>') }); }).catch(function (e) { toast(e.message, 'e'); }); };
     if ($('#rs')) $('#rs').onclick = function () { LU.modal({ title: 'Pulihkan dari backup', body: '<div class="al danger">Seluruh data saat ini akan DIGANTI isi backup. Sistem membuat backup otomatis sebelum memulihkan.</div><label class="f"><span>ID file backup di Drive</span><input class="inp" id="rid"></label><label class="f mt"><span>Ketik RESTORE</span><input class="inp" id="rcf"></label>', actions: [{ label: 'Pulihkan', cls: 'd', fn: function (c, w) { rpc('restore', { fileId: $('#rid', w).value.trim(), confirm: $('#rcf', w).value }).then(function (r) { c(); toast('Dipulihkan dari ' + r.restoredFrom, 's'); LU.reboot(); }).catch(function (e) { toast(e.message, 'e'); }); } }] }); };
   }
   if (tab === 'license') {
     var L = S.boot.license;
     sb.innerHTML = '<div class="grid g2"><div class="card"><h3>Status lisensi</h3><p>' + chip(L.mode) + ' ' + (L.tier ? chip(L.tier) : '') + '</p>' + (L.licensee ? '<p>Pemegang: <b>' + esc(L.licensee) + '</b><br>ID: ' + esc(L.lid) + '<br>Berlaku s/d: ' + esc(L.exp) + '</p>' : '') + (L.daysLeft != null ? '<p>Sisa trial: <b>' + L.daysLeft + ' hari</b></p>' : '') + (L.reason ? '<div class="al warn">' + esc(L.reason) + '</div>' : '') + '<p class="sm muted">Batas: ' + (L.limits.users || '∞') + ' pengguna · ' + (L.limits.projects || '∞') + ' proyek · AI ' + (L.limits.ai ? 'ya' : 'tidak') + '</p></div>' +
-      '<div class="card"><h3>Aktivasi</h3>' + (admin ? '<textarea class="inp" id="lk" placeholder="Tempel kunci lisensi dari penyedia"></textarea><button class="btn p mt" id="la">' + ic('key') + 'Aktifkan</button>' : '<p class="muted">Hanya admin.</p>') + '<p class="sm muted mt">Kunci ditandatangani RSA-2048 oleh penyedia dan diverifikasi offline di server Anda. Bila lisensi habis, aplikasi masuk mode baca saja — data tidak dihapus dan tetap bisa diekspor.</p></div></div>';
+      (LU.MODE === 'supa' ? '<div class="card"><h3>Lisensi Platform Inti</h3><p>Lisensi edisi Supabase diatur per organisasi di <b>Platform Inti → Lisensi</b> (aplikasi <b>langitukur</b>), bukan dengan kunci di sini.</p><p class="sm muted">Bila lisensi habis, aplikasi masuk mode baca saja — data tidak dihapus dan tetap bisa diekspor.</p></div></div>' : '') +
+      (LU.MODE === 'supa' ? '' : '<div class="card"><h3>Aktivasi</h3>' + (admin ? '<textarea class="inp" id="lk" placeholder="Tempel kunci lisensi dari penyedia"></textarea><button class="btn p mt" id="la">' + ic('key') + 'Aktifkan</button>' : '<p class="muted">Hanya admin.</p>') + '<p class="sm muted mt">Kunci ditandatangani RSA-2048 oleh penyedia dan diverifikasi offline di server Anda. Bila lisensi habis, aplikasi masuk mode baca saja — data tidak dihapus dan tetap bisa diekspor.</p></div></div>');
     if ($('#la')) $('#la').onclick = function () { rpc('licenseActivate', { key: $('#lk').value }).then(function () { toast('Lisensi aktif', 's'); LU.reboot(); }).catch(function (e) { toast(e.message, 'e'); }); };
   }
   if (tab === 'test') {
