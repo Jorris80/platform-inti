@@ -2343,14 +2343,49 @@ E.license = function () {
   return Object.assign(base, { mode: 'LICENSED', writable: true });
 };
 
+/* ---------- pencatat perubahan (Tahap 2b) ----------
+ * writeRow_ tidak lagi menulis ke Google Sheets: perubahan diterapkan ke memori lalu
+ * dicatat. Setelah aksi selesai, semua catatan dikirim sekaligus ke lu_apply (satu transaksi).
+ * Bila aksi atau server menolak, memori dikembalikan seperti semula. */
+var CAP = null;
+E.begin = function () { CAP = { ops: [], undo: [] }; };
+E.end = function () { var c = CAP || { ops: [], undo: [] }; CAP = null; return c; };
+E.rollback = function (c) { for (var i = c.undo.length - 1; i >= 0; i--) try { c.undo[i](); } catch (e) { } Object.keys(E.store).forEach(reindex); };
+E.collapse = function (ops) {
+  var m = {}, out = [];
+  ops.forEach(function (o) { var key = o.t + '|' + o.id; if (m[key]) { m[key].row = o.row; } else { m[key] = { t: o.t, k: o.k, v0: o.v0, id: o.id, row: o.row }; out.push(m[key]); } });
+  return out.map(function (o) { return { t: o.t, k: o.k, v0: o.v0, row: o.row }; });
+};
+E.ack = function (rows) {
+  (rows || []).forEach(function (r) { var a = E.store[r.t] || []; for (var i = 0; i < a.length; i++) if (a[i].id === r.id) { a[i].version = r.version; a[i].updated_at = E.ts(r.updated_at); a[i].updated_by = r.updated_by; break; } });
+};
+E.row = function (t, id) { return (E.store[t] || []).filter(function (r) { return r.id === id; })[0] || null; };
+var ORIG = { audit_: G.audit_ };
+
 /* ---------- penggantian fungsi .gs ---------- */
 CFG.DEMO = false;
+G.writeRow_ = function (t, obj, isNew) {
+  var a = E.store[t] || (E.store[t] = []), o = clone_(obj); delete o._row;
+  if (!o.org_id) o.org_id = E.org;
+  if (isNew) {
+    o._row = a.length + 2; a.push(o);
+    if (CAP) { CAP.undo.push(function () { var i = a.indexOf(o); if (i >= 0) a.splice(i, 1); }); CAP.ops.push({ t: t, k: 'ins', id: o.id, v0: null, row: strip(o) }); }
+  } else {
+    var i = -1; for (var j = 0; j < a.length; j++) if (a[j].id === o.id) { i = j; break; }
+    if (i < 0) err_('Data tidak ditemukan: ' + t + '/' + o.id, 'NOT_FOUND');
+    var prev = a[i]; o._row = prev._row; a[i] = o;
+    if (CAP) { CAP.undo.push(function () { var k = a.indexOf(o); if (k >= 0) a[k] = prev; }); CAP.ops.push({ t: t, k: 'upd', id: o.id, v0: +prev.version || 0, row: strip(o) }); }
+  }
+  MEMO.pids = null;
+  var res = clone_(o); return res;
+};
+function strip(o) { var r = {}; for (var k in o) if (k !== '_row') r[k] = o[k]; return r; }
 G.getSession_ = function () { if (!E.sess) err_('Sesi tidak ada. Silakan login.', 'AUTH'); return (MEMO.sess = E.sess); };
 G.readRows_ = function (t) { return E.store[t] || (E.store[t] = []); };
 G.licenseStatus_ = function () { return MEMO.lic || (MEMO.lic = E.license()); };
 G.can_ = function (s, mod, act) { if (E.stage === '2a' && act !== 'v') return false; return String(E.perms[mod] || '').indexOf(act) >= 0; };
 G.rateLimit_ = function () { };
-G.audit_ = function () { };
+G.audit_ = function () { if (E.stage === '2a') return; return ORIG.audit_.apply(null, arguments); };
 G.secretStatus_ = function () { return null; };
 G.capacity_ = function () { return { used: 0, limit: CFG.CELL_LIMIT, pct: 0, warn: false, sheets: [] }; };
 })(window);
@@ -2361,22 +2396,27 @@ G.capacity_ = function () { return { used: 0, limit: CFG.CELL_LIMIT, pct: 0, war
  * LangitUkur — EDISI SUPABASE · penghubung (pengganti google.script.run)
  * Tampilan LangitUkur TIDAK diubah: setiap panggilan rpc(aksi, data) diteruskan ke sini.
  *
- * Tahap 2a (membaca data):
+ * Tahap 2a (membaca data) + Tahap 2b (menulis data):
  *  - Login memakai email & password Platform Inti (Supabase Auth). Bila sudah login di
  *    Platform Inti pada browser yang sama, langsung masuk tanpa mengetik ulang.
  *  - Saat masuk, data tabel lu_* diunduh (per 1.000 baris, 6 tabel sekaligus) dan disimpan
  *    di memori. Tiap 60 detik hanya baris yang BERUBAH yang diambil ulang (lu_changes).
  *  - Perhitungan (dashboard, RAB, kurva-S, EVM, QC RMSE, jadwal, laporan, ekspor CSV)
  *    memakai kode server .gs yang SAMA → angka identik dengan versi Google Sheets.
- *  - Menyimpan/mengubah data aktif di Tahap 2b; pengguna, pengaturan, AI & lisensi di Tahap 2c.
+ *  - Tahap 2b: aksi simpan/ubah/hapus/ajukan/setujui/RAB/QC/laporan/sinkron offline dijalankan mesin yang sama;
+ *    semua perubahannya dikirim SEKALIGUS ke lu_apply (satu transaksi; izin, cakupan proyek, status persetujuan
+ *    & konflik versi diperiksa database). File diunggah ke Supabase Storage (bucket langitukur).
+ *  - Pengguna, profil/password, pengaturan, AI, PDF/XLSX & lisensi di Tahap 2c.
  * ========================================================================== */
 (function (G) {
 'use strict';
-var STAGE = '2a', BUILD = '2a-1', E = G.SUPA_ENGINE, C = G.LU_SUPA_CONFIG || {};
+var STAGE = '2b', BUILD = '2b-1', E = G.SUPA_ENGINE, C = G.LU_SUPA_CONFIG || {};
 var sb = null, WHO = null, loadedAt = 0, since = null, loading = null, lastErr = null;
 var REFRESH_MS = 60000, PAGE = 1000, PAR = 6;
-var READONLY_MSG = 'Uji Tahap 2a — data hanya bisa DILIHAT. Menyimpan, mengubah & menyetujui data aktif setelah Tahap 2b.';
-var LATER = { upload: '2b', exportXlsx: '2c', reportPdf: '2c', backupNow: '2c', restore: '2c', weather: '2c', mfaSetup: '3', aiAsk: '2c', maintenance: '2c', licenseActivate: '2c', secretSave: '2c', demoSeed: '-' };
+var LOCK = Promise.resolve();
+function serial(fn) { var p = LOCK.then(fn, fn); LOCK = p.catch(function () { }); return p; }
+var LATER = { exportXlsx: '2c', reportPdf: '2c', backupNow: '2c', restore: '2c', weather: '2c', mfaSetup: '3', mfaEnable: '3', mfaDisable: '3', aiAsk: '2c', maintenance: '2c', licenseActivate: '2c', secretSave: '2c',
+  userCreate: '2c', resetPassword: '2c', profileSave: '2c', changePassword: '2c', settingsSave: '2c', demoSeed: '-' };
 
 function fail(msg, code) { return { ok: false, error: msg, code: code || 'ERR' }; }
 function ok(data) { return { ok: true, data: data }; }
@@ -2493,22 +2533,93 @@ function call(action, payload, token) {
     }, mapErr);
   }
   if (action === 'logout') { E.clear(); loadedAt = 0; return client().auth.signOut().then(function () { return ok({ ok: true }); }, function () { return ok({ ok: true }); }); }
-  if (action === 'sync') { var n = new Error('Antrean offline disimpan di perangkat; dikirim setelah Tahap 2b aktif.'); n.code = 'NET'; return Promise.reject(n); }
   if (LATER[action]) return Promise.resolve(fail('Fitur ini aktif di Tahap ' + LATER[action] + ' edisi Supabase.', 'READONLY'));
-  if (G.WRITE_ACTIONS && G.WRITE_ACTIONS[action] && action !== 'notifRead') return Promise.resolve(fail(READONLY_MSG, 'READONLY'));
-  if (action === 'notifRead') return Promise.resolve(ok({ ok: true }));
+  var isWrite = !!(G.WRITE_ACTIONS && G.WRITE_ACTIONS[action]) || action === 'upload';
   return session().then(function (s) {
     if (!s) { E.clear(); return fail('Sesi berakhir. Silakan login kembali.', 'AUTH'); }
+    if (isWrite && E.loaded && Date.now() - loadedAt > 5000) loadedAt = 1;   // tulis: pakai data terbaru
     var p = E.loaded ? refresh() : loadAll();
     return p.then(function () {
       if (action === 'capacity') return rpcSb('lu_capacity', { p_org: E.org }).then(function (c) { return ok({ supabase: true, used: c.db_bytes, limit: c.db_limit, pct: Math.round(c.db_bytes / c.db_limit * 10000) / 100, warn: c.db_bytes / c.db_limit > 0.8, rows: c.rows, sheets: c.tables.map(function (x) { return { sheet: x.sheet, cells: x.rows, rows: x.rows }; }) }); });
-      return runGas(action, payload);
+      if (action === 'upload') return upload(payload);
+      if (action === 'sync') return serial(function () { return syncOps(payload.ops || []); });
+      return isWrite ? serial(function () { return runWrite(action, payload, true); }) : runWrite(action, payload, false);
     });
   }).catch(mapErr);
 }
 
+/* ---------- menjalankan aksi + mengirim perubahannya ke lu_apply ---------- */
+function runWrite(action, payload, strict) {
+  E.begin(); var out = runGas(action, payload), cap = E.end();
+  if (!out.ok) { E.rollback(cap); return Promise.resolve(out); }
+  var ops = E.collapse(cap.ops);
+  if (!ops.length) return Promise.resolve(out);
+  return rpcSb('lu_apply', { p_org: E.org, p_action: action, p_ops: ops }).then(function (r) {
+    E.ack(r.rows); return out;
+  }, function (err) {
+    E.rollback(cap);
+    if (!strict) return out;                       // aksi baca: catatan audit boleh gagal
+    var m = explain(err);
+    if (m === 'NET') { var n = new Error('Tidak ada koneksi ke server.'); n.code = 'NET'; throw n; }
+    if ((err && err.hint === 'CONFLICT') || /^Konflik/.test(m)) {
+      loadedAt = 1;
+      return refresh().then(function () {
+        var rec = payload && (payload.record || {}), t = payload && payload.table, cur = t && rec.id ? E.row(t, rec.id) : null;
+        if (action === 'save' && cur) return ok({ conflict: true, server: cur });
+        return fail(m, 'CONFLICT');
+      });
+    }
+    if (/READONLY/.test(err && err.hint || '')) return fail(m, 'READONLY');
+    return mapErr(err);
+  });
+}
+/* sinkron antrean offline: per data, supaya satu konflik tidak menggagalkan yang lain */
+function syncOps(ops) {
+  var res = [], i = 0;
+  function next() {
+    if (i >= ops.length) return Promise.resolve(ok(res));
+    var op = ops[i++];
+    return runWrite('sync', { ops: [op] }, true).then(function (out) {
+      if (out.ok) res.push(out.data[0]);
+      else if (out.code === 'CONFLICT') res.push({ cid: op.cid, status: 'conflict', error: out.error, data: { server: op.record && op.record.id ? E.row(op.table, op.record.id) : null } });
+      else res.push({ cid: op.cid, status: 'error', error: out.error, code: out.code });
+      return next();
+    });
+  }
+  return next();
+}
+/* unggah file ke Supabase Storage: <org>/<proyek>/<folder>/<acak>-<nama> */
+function upload(p) {
+  return serial(function () {
+    var s = E.sess, pr = E.perms;
+    if (!p.project_id) return fail('Pilih proyek dulu.');
+    if (!E.row('projects', p.project_id)) return fail('Proyek ini di luar cakupan Anda.', 'FORBIDDEN');
+    if (!/c/.test(pr.documents || '') && !/c/.test(pr.field || '') && !/c/.test(pr.images || '') && !/u/.test(pr.equipment || '')) return fail('Akses unggah ditolak.', 'FORBIDDEN');
+    var lic = E.license(); if (!lic.writable) return fail('Mode baca saja: ' + lic.reason, 'READONLY');
+    var mime = String(p.mime || '').toLowerCase(); if (!G.UPLOAD_MIME[mime]) return fail('Tipe file tidak diizinkan: ' + mime);
+    var bin = atob(String(p.b64 || '')), bytes = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    if (bytes.length > 10 * 1024 * 1024) return fail('Maksimal 10 MB per file.');
+    if (mime === 'image/jpeg' && !(bytes[0] === 0xff && bytes[1] === 0xd8)) return fail('Isi file bukan JPEG.');
+    if (mime === 'image/png' && !(bytes[0] === 0x89 && bytes[1] === 0x50)) return fail('Isi file bukan PNG.');
+    if (mime === 'application/pdf' && !(bytes[0] === 0x25 && bytes[1] === 0x50)) return fail('Isi file bukan PDF.');
+    var name = String(p.name || 'file').replace(/[^\w.\- ()]/g, '_').slice(0, 120), folder = (G.FOLDERS || []).indexOf(p.folder) >= 0 ? p.folder : '09_DELIVERY';
+    var path = E.org + '/' + p.project_id + '/' + folder + '/' + Math.random().toString(36).slice(2, 10) + '-' + name.replace(/ /g, '_');
+    return crypto.subtle.digest('SHA-256', bytes).then(function (h) {
+      var sum = Array.prototype.map.call(new Uint8Array(h), function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+      return client().storage.from('langitukur').upload(path, new Blob([bytes], { type: mime }), { contentType: mime, upsert: false }).then(function (r) {
+        if (r.error) return fail('Gagal mengunggah file ke Supabase Storage: ' + r.error.message);
+        return ok({ url: 'sb://langitukur/' + path, id: path, name: name, size: bytes.length, sha256: sum, storage: 'supabase' });
+      });
+    });
+  });
+}
+function signedUrl(ref) {
+  var m = String(ref || '').match(/^sb:\/\/([^/]+)\/(.+)$/); if (!m) return Promise.resolve(ref);
+  return client().storage.from(m[1]).createSignedUrl(m[2], 3600).then(function (r) { if (r.error) throw new Error('File tidak bisa dibuka: ' + r.error.message); return r.data.signedUrl; });
+}
+
 G.LU_SUPA = {
-  call: call, stage: STAGE, build: BUILD,
+  call: call, stage: STAGE, build: BUILD, signedUrl: signedUrl,
   hasSession: function () { try { client(); } catch (e) { return Promise.resolve(false); } return session().then(function (s) { return !!s; }, function () { return false; }); },
   configError: cfgError,
   reload: function () { loadedAt = 0; E.loaded = false; return loadAll(); },
@@ -2574,6 +2685,7 @@ Object.assign(LU, { $: $, $$: $$, esc: esc, num: num, rp: rp, dt: dt, chip: chip
 function toast(msg, type) { var w = $('#toast'); if (!w) return; var d = document.createElement('div'); d.className = type || ''; d.textContent = msg; w.appendChild(d); setTimeout(function () { d.remove(); }, type === 'e' ? 5200 : 2800); }
 var busyN = 0; function busy(on) { busyN += on ? 1 : -1; if (busyN < 0) busyN = 0; var p = $('#pbar'); if (!p) return; if (busyN) { p.style.opacity = 1; p.style.width = '70%'; } else { p.style.width = '100%'; setTimeout(function () { if (!busyN) { p.style.opacity = 0; p.style.width = 0; } }, 250); } }
 LU.toast = toast; LU.busy = busy;
+LU.openFile = function (u) { u = String(u || '').trim(); if (!u) return toast('Belum ada file.'); if (/^sb:\/\//.test(u)) { var w = window.open('', '_blank'); return window.LU_SUPA.signedUrl(u).then(function (x) { if (w) w.location = x; else location.href = x; }).catch(function (e) { if (w) w.close(); toast(e.message, 'e'); }); } if (!/^https?:\/\//.test(u)) return toast('Tautan tidak dikenali.', 'e'); window.open(u, '_blank', 'noopener'); };
 
 /* ---------------- IndexedDB mini ---------------- */
 var dbp = null;
@@ -3055,7 +3167,7 @@ function inputFor(t, f, v, isNew) {
     if (f.k === 'photo' || f.k === 'snapshot') return '';
     return lab('<textarea class="inp"' + name + (ro ? ' disabled' : '') + '>' + esc(val) + '</textarea>', true);
   }
-  if (f.t === 'file') return lab('<div class="row" style="flex-wrap:nowrap"><input class="inp"' + name + ' value="' + esc(val) + '" placeholder="URL Google Drive / tautan file"><button type="button" class="btn s" data-up="' + f.k + '" title="Unggah ke Drive">' + ic('ul') + '</button>' + (val ? '<a class="btn s" target="_blank" rel="noopener" href="' + esc(val) + '">' + ic('eye') + '</a>' : '') + '</div>');
+  if (f.t === 'file') return lab('<div class="row" style="flex-wrap:nowrap"><input class="inp"' + name + ' value="' + esc(val) + '" placeholder="URL Google Drive / tautan file"><button type="button" class="btn s" data-open="' + f.k + '" title="Buka file">' + ic('eye') + '</button><button type="button" class="btn s" data-up="' + f.k + '" title="Unggah ke Drive">' + ic('ul') + '</button>' + (val ? '<a class="btn s" target="_blank" rel="noopener" href="' + esc(val) + '">' + ic('eye') + '</a>' : '') + '</div>');
   var type = { number: 'number', date: 'date', datetime: 'datetime-local', email: 'email' }[f.t] || 'text';
   if (type === 'datetime-local' && val) val = String(val).slice(0, 16).replace(' ', 'T');
   return lab('<input class="inp" type="' + type + '"' + (type === 'number' ? ' step="any"' : '') + name + ph + ' value="' + esc(val) + '">');
@@ -3103,7 +3215,8 @@ function bindFormExtras(w, t, r) {
     if (typeSel && !r.id) typeSel.onchange = function () { items = base(); paint(); };
     paint();
   });
-  $$('[data-up]', w).forEach(function (b) { b.onclick = function () { LU.pickUpload(r.project_id || S.pid, t === 'documents' ? ($('[name=folder]', w) || {}).value : null).then(function (u) { if (!u) return; var inp = $('[name=' + b.getAttribute('data-up') + ']', w); inp.value = u.url; var cs = $('[name=checksum]', w); if (cs && !cs.value) cs.value = u.sha256; var tt = $('[name=title]', w); if (tt && !tt.value) tt.value = u.name; toast('Terunggah ke Drive', 's'); }); }; });
+  $$('[data-open]', w).forEach(function (b) { b.onclick = function () { LU.openFile($('[name=' + b.getAttribute('data-open') + ']', w).value); }; });
+  $$('[data-up]', w).forEach(function (b) { b.onclick = function () { LU.pickUpload(r.project_id || S.pid, t === 'documents' ? ($('[name=folder]', w) || {}).value : null).then(function (u) { if (!u) return; var inp = $('[name=' + b.getAttribute('data-up') + ']', w); inp.value = u.url; var cs = $('[name=checksum]', w); if (cs && !cs.value) cs.value = u.sha256; var tt = $('[name=title]', w); if (tt && !tt.value) tt.value = u.name; toast(u.storage === 'supabase' ? 'Terunggah ke penyimpanan Supabase' : 'Terunggah ke Drive', 's'); }); }; });
   $$('[data-draw]', w).forEach(function (b) { b.onclick = function () { var ta = $('[name=' + b.getAttribute('data-draw') + ']', w); LU.drawOnMap(ta.value, function (gj) { ta.value = gj; toast('Geometri diperbarui — tekan Simpan.'); }); }; });
   $$('[data-geofile]', w).forEach(function (b) { b.onclick = function () { LU.readGeoFile().then(function (gj) { if (gj) { $('[name=' + b.getAttribute('data-geofile') + ']', w).value = gj; toast('Geometri dimuat.'); } }); }; });
   if (t === 'flights') { var alt = $('[name=altitude_m]', w); if (alt) alt.insertAdjacentHTML('afterend', '<span class="sm muted">GSD, estimasi foto & durasi dihitung server dari kamera drone + luas area.</span>'); }
