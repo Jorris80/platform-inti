@@ -1,0 +1,38 @@
+{
+  "name": "LangitUkur — Drone Survey (Platform Inti)",
+  "short_name": "LangitUkur",
+  "description": "Manajemen proyek survei foto udara — edisi Supabase / Platform Inti. Bisa dibuka offline.",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "lang": "id",
+  "background_color": "#0f3d5e",
+  "theme_color": "#0f3d5e",
+  "categories": [
+    "business",
+    "productivity",
+    "utilities"
+  ],
+  "icons": [
+    {
+      "src": "icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

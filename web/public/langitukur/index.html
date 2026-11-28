@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0f3d5e"><meta name="description" content="LangitUkur — sistem manajemen survei drone enterprise"><title>LangitUkur — Edisi Supabase</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0f3d5e"><meta name="description" content="LangitUkur — sistem manajemen survei drone enterprise"><title>LangitUkur — Edisi Supabase</title><link rel="manifest" href="manifest.json"><link rel="icon" type="image/png" href="icon.png"><link rel="apple-touch-icon" href="icon.png"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
 /* LangitUkur — tema dinamis (CSS variables). Preset: aero, emerald, sunset, graphite, ocean; mode terang/gelap */
 :root{--pri:#0f3d5e;--pri2:#1d6fa5;--acc:#38bdf8;--bg:#f3f6fa;--bg2:#e8eef5;--card:#ffffff;--tx:#14212e;--mut:#64748b;--line:#dde5ee;--ok:#16a34a;--warn:#d97706;--bad:#dc2626;--info:#2563eb;
@@ -2330,6 +2330,16 @@ E.setData = function (o) {
   E.sess = { user: me, uid: me.id, org: org, role: o.who.role, email: o.who.user.email || me.email, name: me.full_name || o.who.user.name, tokenHash: 'supa' };
   E.loaded = true;
 };
+/* Tahap 3: salinan lengkap untuk dibuka saat offline */
+E.snapshot = function () { return { v: 1, who: E.who, org: E.org, perms: E.perms, store: E.store, secrets: E.secrets, uid: E.sess && E.sess.uid }; };
+E.restore = function (d) {
+  E.who = d.who; E.org = d.org; E.perms = d.perms || {}; E.store = d.store || {}; E.secrets = d.secrets || {};
+  Object.keys(SCHEMA).forEach(function (t) { if (!E.store[t]) E.store[t] = []; });
+  Object.keys(E.store).forEach(reindex);
+  var me = E.store.users.filter(function (u) { return u.id === d.uid; })[0] || { id: d.uid, full_name: d.who.user.name, email: d.who.user.email, role: d.who.role };
+  E.sess = { user: me, uid: me.id, org: d.org, role: d.who.role, email: d.who.user.email || me.email, name: me.full_name || d.who.user.name, tokenHash: 'supa' };
+  E.loaded = true;
+};
 E.applyFin = function (fin) {
   Object.keys(fin || {}).forEach(function (t) { var m = fin[t] || {}; (E.store[t] || []).forEach(function (r) { if (m[r.id]) Object.keys(m[r.id]).forEach(function (k) { r[k] = m[r.id][k] == null ? '' : m[r.id][k]; }); }); });
 };
@@ -2424,16 +2434,18 @@ G.capacity_ = function () { return { used: 0, limit: CFG.CELL_LIMIT, pct: 0, war
  *    & konflik versi diperiksa database). File diunggah ke Supabase Storage (bucket langitukur).
  *  - Tahap 2c: pengguna & role, profil & password (Supabase Auth), pengaturan & branding, kunci rahasia
  *    (tabel lu_secrets), Asisten AI, cuaca & WhatsApp lewat Edge Function langitukur-proxy, XLSX & backup di browser.
- *  - MFA & PWA penuh di Tahap 3.
+ *  - Tahap 3: MFA (TOTP Supabase Auth, ditegakkan database), PWA terpasang & offline penuh
+ *    (salinan data terenkripsi-browser di IndexedDB, antrean simpan offline), token webhook adapter.
  * ========================================================================== */
 (function (G) {
 'use strict';
-var STAGE = '2c', BUILD = '2c-1', E = G.SUPA_ENGINE, C = G.LU_SUPA_CONFIG || {};
+var STAGE = '3', BUILD = '3-1', E = G.SUPA_ENGINE, C = G.LU_SUPA_CONFIG || {};
 var sb = null, WHO = null, loadedAt = 0, since = null, loading = null, lastErr = null;
 var REFRESH_MS = 60000, PAGE = 1000, PAR = 6;
 var LOCK = Promise.resolve();
 function serial(fn) { var p = LOCK.then(fn, fn); LOCK = p.catch(function () { }); return p; }
-var LATER = { mfaSetup: '3', mfaEnable: '3', mfaDisable: '3' };
+var LATER = {};
+var OFF = false, PENDING_FACTOR = null;
 var NA = {
   maintenance: 'Tidak diperlukan di edisi Supabase (tidak ada batas 10 juta sel).',
   restore: 'Pemulihan di edisi Supabase memakai Supabase → Database → Backups (otomatis harian pada paket berbayar), atau impor ulang dengan 09_PindahSupabase.gs.',
@@ -2465,6 +2477,7 @@ function explain(err) {
   if (code === '42P01' || code === 'PGRST205' || /relation .*lu_.* does not exist|Could not find the table/i.test(m)) return 'Tabel LangitUkur belum ada di proyek Supabase ini. config.js menunjuk proyek yang belum menjalankan SQL Tahap 1.';
   if (/Failed to fetch|NetworkError|Load failed/i.test(m)) return 'NET';
   if (/JWT expired|invalid JWT|refresh_token/i.test(m)) return 'AUTH:Sesi berakhir. Silakan login kembali.';
+  if ((err && err.hint === 'MFA_REQUIRED') || /memakai MFA/.test(m)) return 'AUTH:Akun ini memakai MFA. Silakan login lagi dan masukkan kode 6 digit.';
   return m;
 }
 function rpcSb(fn, args) {
@@ -2489,6 +2502,47 @@ function fetchTable(t, org) {
 }
 function progress(txt) { try { var s = document.getElementById('supaProg'); if (s) s.textContent = txt; else if (G.LU && G.LU.toast && txt) { /* diam */ } } catch (e) { } }
 
+/* ---------- Tahap 3: salinan data di perangkat (untuk dibuka saat offline) ----------
+ * Disimpan per akun di IndexedDB browser ini; dihapus saat Keluar. Akun lain di browser
+ * yang sama tidak bisa memakainya (kuncinya id akun + harus punya sesi login yang sama). */
+var SNAP_DB = 'langitukur-supa-snap', snapT = null;
+function snapDb() { return new Promise(function (res) { try { if (!G.indexedDB) return res(null); var r = indexedDB.open(SNAP_DB, 1); r.onupgradeneeded = function () { r.result.createObjectStore('snap'); }; r.onsuccess = function () { res(r.result); }; r.onerror = function () { res(null); }; } catch (e) { res(null); } }); }
+function snapTx(mode, fn) { return snapDb().then(function (d) { if (!d) return null; return new Promise(function (res) { var tx = d.transaction('snap', mode), st = tx.objectStore('snap'), q = fn(st); tx.oncomplete = function () { res(q && q.result !== undefined ? q.result : null); }; tx.onerror = function () { res(null); }; tx.onabort = function () { res(null); }; }); }); }
+function snapSave(now) {
+  if (!E.loaded || !WHO || OFF) return; clearTimeout(snapT);
+  snapT = setTimeout(function () { var k = WHO.user && WHO.user.auth_id; if (!k) return; var d = E.snapshot(); d.since = since; d.savedAt = new Date().toISOString(); snapTx('readwrite', function (st) { st.put(d, k); }); }, now ? 0 : 1500);
+}
+function snapLoad(authId) { return authId ? snapTx('readonly', function (st) { return st.get(authId); }) : Promise.resolve(null); }
+function snapClear(keep) { return snapTx('readwrite', function (st) { if (!keep) return st.clear(); var c = st.openCursor(); c.onsuccess = function () { var x = c.result; if (x) { if (x.key !== keep) x.delete(); x.continue(); } }; }); }
+function restoreSnap(sess) {
+  var id = sess && sess.user && sess.user.id;
+  return snapLoad(id).then(function (d) {
+    if (!d || !d.who || !d.who.user || d.who.user.auth_id !== id) return false;
+    var was = OFF; E.stage = STAGE; E.restore(d); WHO = d.who; since = d.since; loadedAt = Date.now(); OFF = true; G.LU_SUPA.snapAt = d.savedAt;
+    try { if (!was && G.LU && G.LU.toast) G.LU.toast('Offline — memakai salinan data di perangkat (' + String(d.savedAt || '').slice(0, 16).replace('T', ' ') + '). Simpanan baru diantrekan.'); } catch (e) { }
+    return true;
+  });
+}
+/* sesi tersimpan di perangkat (dipakai saat offline; token tidak bisa diperbarui tanpa internet) */
+function storedSession() {
+  try { for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); if (/^sb-.+-auth-token$/.test(k)) { var v = JSON.parse(localStorage.getItem(k) || 'null'); if (v && v.access_token && v.user) return Object.assign({ offline: true }, v); } } } catch (e) { }
+  return null;
+}
+function netErr() { var n = new Error('Tidak ada koneksi ke server.'); n.code = 'NET'; return n; }
+function isOffline() { return OFF || (typeof navigator !== 'undefined' && navigator.onLine === false); }
+
+/* ---------- MFA (Supabase Auth TOTP) ---------- */
+function aal() { return client().auth.mfa.getAuthenticatorAssuranceLevel().then(function (r) { if (r.error) throw r.error; return r.data || {}; }); }
+function totpFactors() { return client().auth.mfa.listFactors().then(function (r) { if (r.error) throw r.error; return r.data || { all: [], totp: [] }; }); }
+function mfaVerify(code) {
+  code = String(code || '').replace(/\s/g, '');
+  if (!/^\d{6}$/.test(code)) return Promise.reject(new Error('Kode MFA harus 6 digit angka.'));
+  return totpFactors().then(function (f) {
+    var fac = (f.totp || [])[0]; if (!fac) throw new Error('Faktor MFA tidak ditemukan.');
+    return client().auth.mfa.challengeAndVerify({ factorId: fac.id, code: code }).then(function (r) { if (r.error) throw new Error('Kode MFA salah atau kedaluwarsa. Pakai kode terbaru dari aplikasi authenticator.'); return fac; });
+  });
+}
+
 /* ---------- unduh semua data organisasi ---------- */
 function loadAll() {
   if (loading) return loading;
@@ -2504,7 +2558,7 @@ function loadAll() {
       var tables = {}; tabs.forEach(function (t, i) { tables[t] = res[0][i]; });
       E.stage = STAGE;
       E.setData({ who: w, tables: tables, settings: res[1], directory: res[2], fin: res[3] }); E.secrets = res[4] || {};
-      since = w.server_time; loadedAt = Date.now(); loading = null;
+      since = w.server_time; loadedAt = Date.now(); loading = null; OFF = false; snapSave(true);
       try { var b = (E.store.settings.filter(function (s) { return s.key === 'branding'; })[0] || {}).value; if (b) localStorage.setItem('lu.supa.brand', b); } catch (e) { }
       G.LU_SUPA.lastLoadMs = Date.now() - t0;
       return true;
@@ -2522,15 +2576,20 @@ function refresh() {
     return [ch, finTouched];
   }).then(function (x) {
     since = x[0].server_time; loadedAt = Date.now();
+    var changed = Object.keys(x[0]).some(function (t) { return t !== 'server_time' && (x[0][t] || []).length; }); if (changed) snapSave();
     if (x[1]) return rpcSb('lu_fin', { p_org: E.org }).then(E.applyFin);
   }).catch(function (e) { loadedAt = Date.now() - REFRESH_MS + 15000; console.warn('Penyegaran gagal', e); });
 }
-function session() { return client().auth.getSession().then(function (r) { return r.data && r.data.session; }); }
+function session() {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return Promise.resolve(storedSession());   // tanpa internet: jangan menunggu perpanjangan token
+  return client().auth.getSession().then(function (r) { return (r.data && r.data.session) || (r.error && explain(r.error) === 'NET' ? storedSession() : null); }, function () { return storedSession(); });
+}
 function runGas(action, payload) {
   var out; try { out = JSON.parse(G.api(action, payload || {}, 'supa', navigator.userAgent.slice(0, 120))); } catch (x) { out = fail(x.message); }
   return out;
 }
 function mapErr(e) {
+  if (e && e.code === 'NET') throw e;
   var m = explain(e);
   if (m === 'NET') { var n = new Error('Tidak ada koneksi ke server.'); n.code = 'NET'; throw n; }
   if (m.indexOf('AUTH:') === 0) return fail(m.slice(5), 'AUTH');
@@ -2552,25 +2611,57 @@ function call(action, payload, token) {
     if (em.indexOf('@') < 0) return Promise.resolve(fail('Masuk memakai EMAIL akun Platform Inti (bukan username lama).', 'AUTH'));
     return client().auth.signInWithPassword({ email: em, password: String(payload.password || '') }).then(function (r) {
       if (r.error) return fail(/invalid login|invalid_credentials|Invalid/i.test(r.error.message) ? 'Email atau password salah. Pakai password akun Platform Inti (password LangitUkur lama tidak berlaku).' : (/confirm/i.test(r.error.message) ? 'Email belum dikonfirmasi. Buka email konfirmasi dari Platform Inti.' : r.error.message), 'AUTH');
-      E.clear(); loadedAt = 0;
-      return loadAll().then(function () { return ok({ token: 'supa', user: E.sess.user, edition: 'supabase' }); }, function (e) { client().auth.signOut().catch(function () { }); return mapErr(e); });
+      E.clear(); loadedAt = 0; OFF = false;
+      return aal().then(function (a) {
+        if (a.nextLevel === 'aal2' && a.currentLevel !== 'aal2') {
+          if (!String(payload.otp || '').trim()) return { mfa: true };
+          return mfaVerify(payload.otp).then(function () { return {}; }, function (e) { return { err: e.message }; });
+        }
+        return {};
+      }).then(function (st) {
+        if (st.mfa) return ok({ mfa: true });
+        if (st.err) return fail(st.err, 'AUTH_FAIL');
+        return loadAll().then(function () { snapClear(WHO.user.auth_id); return ok({ token: 'supa', user: E.sess.user, edition: 'supabase' }); }, function (e) { client().auth.signOut().catch(function () { }); return mapErr(e); });
+      });
     }, mapErr);
   }
-  if (action === 'logout') { E.clear(); loadedAt = 0; return client().auth.signOut().then(function () { return ok({ ok: true }); }, function () { return ok({ ok: true }); }); }
+  if (action === 'logout') { clearTimeout(snapT); var who0 = WHO; E.clear(); WHO = null; loadedAt = 0; OFF = false; snapClear(null); return client().auth.signOut().then(function () { return ok({ ok: true }); }, function () { return ok({ ok: true }); }); }
   if (LATER[action]) return Promise.resolve(fail('Fitur ini aktif di Tahap ' + LATER[action] + ' edisi Supabase.', 'READONLY'));
   if (NA[action]) return Promise.resolve(fail(NA[action], 'NA'));
   var isWrite = !!(G.WRITE_ACTIONS && G.WRITE_ACTIONS[action]) || action === 'upload';
   return session().then(function (s) {
     if (!s) { E.clear(); return fail('Sesi berakhir. Silakan login kembali.', 'AUTH'); }
+    if (s.offline || (typeof navigator !== 'undefined' && navigator.onLine === false)) {
+      // tanpa internet: pakai salinan di perangkat; simpanan dilempar sebagai NET → diantrekan core.js
+      var po = E.loaded ? Promise.resolve(true) : restoreSnap(s);
+      return po.then(function (has) {
+        if (!has) throw netErr();
+        OFF = true;
+        if (action === 'save' || action === 'remove') {               // periksa isian di perangkat dulu → salah isi langsung diberi tahu
+          E.begin(); var chk = runGas(action, payload), cp0 = E.end(); E.rollback(cp0);
+          if (!chk.ok && chk.code !== 'NEED_FETCH') return chk;
+        }
+        if (isWrite || action === 'capacity' || SPECIAL[action] || action === 'upload') throw netErr();
+        return runWrite(action, payload, false);
+      });
+    }
+    if (OFF) { E.loaded = false; loadedAt = 0; }                                // baru tersambung lagi: muat ulang penuh
     if (isWrite && E.loaded && Date.now() - loadedAt > 5000) loadedAt = 1;   // tulis: pakai data terbaru
-    var p = E.loaded ? refresh() : loadAll();
+    var p = E.loaded ? refresh() : loadAll().catch(function (e) {
+      if (explain(e) !== 'NET') throw e;
+      return restoreSnap(s).then(function (has) { if (!has) throw e; if (isWrite || SPECIAL[action] || action === 'upload' || action === 'capacity') throw netErr(); });
+    });
     return p.then(function () {
+      if (OFF) return runWrite(action, payload, false);
       if (action === 'capacity') return rpcSb('lu_capacity', { p_org: E.org }).then(function (c) { return ok({ supabase: true, used: c.db_bytes, limit: c.db_limit, pct: Math.round(c.db_bytes / c.db_limit * 10000) / 100, warn: c.db_bytes / c.db_limit > 0.8, rows: c.rows, sheets: c.tables.map(function (x) { return { sheet: x.sheet, cells: x.rows, rows: x.rows }; }) }); });
       if (action === 'upload') return upload(payload);
       if (SPECIAL[action]) return serial(function () { return SPECIAL[action](payload); });
       if (action === 'sync') return serial(function () { return syncOps(payload.ops || []); });
       return isWrite ? serial(function () { return runWrite(action, payload, true); }) : runWrite(action, payload, false);
     });
+  }).then(function (out) {
+    if (action === 'bootstrap' && out && out.ok && out.data && out.data.user) { out.data.user.mfa_enabled = !!(WHO && WHO.mfa); out.data.offline = OFF; out.data.snapAt = OFF ? G.LU_SUPA.snapAt : null; }
+    return out;
   }).catch(mapErr);
 }
 
@@ -2587,9 +2678,9 @@ function runWrite(action, payload, strict, tries) {
   E.fetchList = [];
   if (!out.ok) { E.rollback(cap); return Promise.resolve(out); }
   var ops = E.collapse(cap.ops);
-  if (!ops.length) return Promise.resolve(out);
+  if (!ops.length || (!strict && OFF)) { if (OFF) E.rollback(cap); return Promise.resolve(out); }
   return rpcSb('lu_apply', { p_org: E.org, p_action: action, p_ops: ops }).then(function (r) {
-    E.ack(r.rows);
+    E.ack(r.rows); snapSave();
     if (ops.some(function (o) { return o.t === 'notifications' && o.k === 'ins'; }) && E.secrets.FONNTE_TOKEN) edge('waDispatch', {}).catch(function () { });
     return out;
   }, function (err) {
@@ -2692,6 +2783,37 @@ function xlsx(cols, rows, title) {
 }
 /* aksi yang di edisi Supabase dikerjakan berbeda dari versi GAS */
 var SPECIAL = {
+  mfaSetup: function () {
+    return totpFactors().then(function (f) {
+      if ((f.totp || []).length) return fail('MFA sudah aktif untuk akun ini.');
+      var old = (f.all || []).filter(function (x) { return x.factor_type === 'totp' && x.status !== 'verified'; });
+      return Promise.all(old.map(function (x) { return client().auth.mfa.unenroll({ factorId: x.id }); })).then(function () {
+        return client().auth.mfa.enroll({ factorType: 'totp', friendlyName: 'LangitUkur', issuer: 'LangitUkur' });
+      }).then(function (r) {
+        if (r.error) return fail('MFA tidak bisa disiapkan: ' + r.error.message + ' (pastikan TOTP aktif di Supabase → Authentication → Multi-Factor).');
+        PENDING_FACTOR = r.data.id;
+        return ok({ secret: r.data.totp.secret, uri: r.data.totp.uri, qr: r.data.totp.qr_code });
+      });
+    }, mapErr);
+  },
+  mfaEnable: function (p) {
+    if (!PENDING_FACTOR) return fail('Kode setup kedaluwarsa, ulangi dari tombol Aktifkan MFA.', 'MFA');
+    var code = String(p.code || '').replace(/\s/g, ''); if (!/^\d{6}$/.test(code)) return fail('Kode harus 6 digit angka.', 'MFA');
+    return client().auth.mfa.challengeAndVerify({ factorId: PENDING_FACTOR, code: code }).then(function (r) {
+      if (r.error) return fail('Kode salah. Pastikan jam HP tepat lalu masukkan kode terbaru.', 'MFA');
+      PENDING_FACTOR = null; if (WHO) WHO.mfa = true; snapSave(true); return ok({ ok: true });
+    }, mapErr);
+  },
+  mfaDisable: function (p) {
+    if (!p.code) return fail('Masukkan kode 6 digit dari aplikasi authenticator.', 'MFA');
+    return mfaVerify(p.code).then(function (fac) {
+      return client().auth.mfa.unenroll({ factorId: fac.id }).then(function (r) { if (r.error) return fail(r.error.message); if (WHO) WHO.mfa = false; snapSave(true); return ok({ ok: true }); });
+    }, function (e) { return fail(e.message, 'MFA'); });
+  },
+  adapterTokenNew: function () {
+    if (['SUPER_ADMIN', 'ORG_ADMIN'].indexOf(E.sess.role) < 0) return fail('Hanya admin.', 'FORBIDDEN');
+    return rpcSb('lu_adapter_token_new', { p_org: E.org }).then(function (tok) { return rpcSb('lu_secret_status', { p_org: E.org }).then(function (st) { E.secrets = st || {}; return ok({ token: tok }); }); }, mapErr);
+  },
   secretSave: function (p) {
     if (['SUPER_ADMIN', 'ORG_ADMIN'].indexOf(E.sess.role) < 0) return fail('Hanya admin.', 'FORBIDDEN');
     return rpcSb('lu_secret_set', { p_org: E.org, p_name: p.name, p_value: p.value || '' }).then(function (st) { E.secrets = st || {}; return ok(G.secretStatus_()); }, mapErr);
@@ -2735,7 +2857,16 @@ function signedUrl(ref) {
 
 G.LU_SUPA = {
   call: call, stage: STAGE, build: BUILD, signedUrl: signedUrl, edge: edge,
-  hasSession: function () { try { client(); } catch (e) { return Promise.resolve(false); } return session().then(function (s) { return !!s; }, function () { return false; }); },
+  hasSession: function () {
+    try { client(); } catch (e) { return Promise.resolve(false); }
+    return session().then(function (s) {
+      if (!s) return false; if (s.offline) return true;
+      return aal().then(function (a) { return !(a.nextLevel === 'aal2' && a.currentLevel !== 'aal2'); }, function () { return true; });
+    }, function () { return false; });
+  },
+  isOffline: function () { return OFF; },
+  webhookUrl: function () { return String(C.url || '').trim().replace(/\/+$/, '').replace(/\/(rest|auth)\/v1.*$/, '') + '/rest/v1/rpc/lu_adapter_callback'; },
+  publicKey: function () { return String(C.key || '').trim(); },
   configError: cfgError,
   reload: function () { loadedAt = 0; E.loaded = false; return loadAll(); },
   staleNow: function () { loadedAt = 1; }
@@ -2827,7 +2958,7 @@ function rpc(action, payload, opt) {
       reject(e);
     }
     function net(err) { if (!opt.silent) busy(false); var e = new Error('Tidak ada koneksi ke server.'); e.code = 'NET'; e.raw = err; setOnline(false); reject(e); }
-    if (MODE === 'supa') { window.LU_SUPA.call(action, payload || {}, S.token).then(function (out) { setOnline(true); done(out); }, function (e) { if (e && e.code === 'NET') return net(e); done({ ok: false, error: (e && e.message) || 'Gagal' }); }); return; }
+    if (MODE === 'supa') { window.LU_SUPA.call(action, payload || {}, S.token).then(function (out) { setOnline(!(window.LU_SUPA.isOffline && window.LU_SUPA.isOffline())); done(out); }, function (e) { if (e && e.code === 'NET') return net(e); done({ ok: false, error: (e && e.message) || 'Gagal' }); }); return; }
     if (MODE === 'demo') { setTimeout(function () { var out; try { out = JSON.parse(window.api(action, payload || {}, S.token, 'demo')); } catch (x) { out = { ok: false, error: x.message }; } window.__demoPersist(); S.online = true; done(out); }, 0); return; }
     if (MODE === 'gas') {
       google.script.run.withSuccessHandler(function (s) { setOnline(true); try { done(JSON.parse(s)); } catch (x) { done({ ok: false, error: 'Respons rusak' }); } }).withFailureHandler(net).api(action, payload || {}, S.token, navigator.userAgent.slice(0, 120));
@@ -2852,7 +2983,7 @@ LU.load = function (t, opt) {
   if (S.mem[k] && !opt.force) { if (opt.bg !== false && !S.mem[k]._fresh) refresh(); return Promise.resolve(S.mem[k]); }
   return refresh();
   function refresh() {
-    return rpc('list', { table: t, project_id: scoped(t) ? pid : undefined }, { silent: !!S.mem[k] }).then(function (r) { r.rows._fresh = true; S.mem[k] = r.rows; IDB.set('kv', 't:' + k, r.rows); return r.rows; })
+    return rpc('list', { table: t, project_id: scoped(t) ? pid : undefined }, { silent: !!S.mem[k] }).then(function (r) { return (S.outbox ? applyOutbox(t, r.rows) : Promise.resolve(r.rows)).then(function (rows) { rows._fresh = true; S.mem[k] = rows; IDB.set('kv', 't:' + k, rows); return rows; }); })
       .catch(function (e) { if (e.code !== 'NET') throw e; return IDB.get('kv', 't:' + k).then(function (rows) { rows = rows || []; return applyOutbox(t, rows).then(function (rs) { S.mem[k] = rs; return rs; }); }); });
   }
 };
@@ -3111,13 +3242,13 @@ LU.start = function (fresh) {
 LU.reboot = function () { return rpc('bootstrap', {}).then(function (B) { S.boot = B; IDB.set('kv', 'boot', B); LU.applyTheme(); LU.renderShell(); LU.go(S.view, S.params, { noPush: true }); }); };
 
 document.addEventListener('DOMContentLoaded', function () {
+  if ((MODE === 'pwa' || MODE === 'supa') && 'serviceWorker' in navigator && /^https?:$/.test(location.protocol)) navigator.serviceWorker.register('sw.js').catch(function () { });
   S.token = lsGet('token', null); S.pid = lsGet('pid', '');
   LU.applyTheme();
   if (MODE === 'pwa' && !apiUrl()) return LU.renderAuth('config');
   if (S.token) return LU.start(false);
   if (MODE === 'supa') return window.LU_SUPA.hasSession().then(function (has) { if (has) return afterLogin({ token: 'supa' }); LU.renderAuth('login'); });
   rpc('publicInfo', {}, { silent: true }).then(function (p) { S.pub = p.branding; LU.applyTheme(); LU.renderAuth(p.needsSetup ? 'setup' : 'login'); }).catch(function () { LU.renderAuth(MODE === 'pwa' ? 'config' : 'login'); });
-  if (MODE === 'pwa' && 'serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(function () { });
 });
 })();
 
@@ -3590,8 +3721,8 @@ LU.V.profile = function (main) {
   if ($('#pdel')) $('#pdel').onclick = function () { savePhoto(''); };
   $('#pf').onsubmit = function (e) { e.preventDefault(); rpc('profileSave', Object.fromEntries(new FormData(e.target).entries())).then(function (r) { S.boot.user = r.user; LU.renderShell(); LU.go('profile', {}, { noPush: true }); toast('Profil tersimpan', 's'); }).catch(function (x) { toast(x.message, 'e'); }); };
   $('#cpf').onsubmit = function (e) { e.preventDefault(); rpc('changePassword', Object.fromEntries(new FormData(e.target).entries())).then(function () { toast('Password diganti', 's'); e.target.reset(); }).catch(function (x) { toast(x.message, 'e'); }); };
-  if ($('#mfon')) $('#mfon').onclick = function () { rpc('mfaSetup', {}).then(function (m) { LU.modal({ title: 'Aktifkan MFA', body: '<ol><li>Buka aplikasi authenticator (Google Authenticator, Microsoft Authenticator, Aegis, dll.).</li><li>Tambah akun → masukkan kunci manual berikut (tipe berbasis waktu):</li></ol><div class="card" style="font-family:monospace;word-break:break-all;font-size:16px">' + esc(m.secret.replace(/(.{4})/g, '$1 ')) + '</div><p><a href="' + esc(m.uri) + '">Buka langsung di aplikasi authenticator (perangkat ini)</a></p><label class="f"><span>Masukkan 6 digit kode dari aplikasi</span><input class="inp" id="mc" inputmode="numeric" maxlength="6"></label>', actions: [{ label: 'Verifikasi & aktifkan', cls: 'p', fn: function (c, w) { rpc('mfaEnable', { code: $('#mc', w).value }).then(function () { c(); toast('MFA aktif', 's'); LU.reboot(); }).catch(function (e) { toast(e.message, 'e'); }); } }] }); }); };
-  if ($('#mfoff')) $('#mfoff').onclick = function () { LU.prompt('Nonaktifkan MFA', 'Masukkan password Anda').then(function (pw) { if (pw) rpc('mfaDisable', { password: pw }).then(function () { toast('MFA dinonaktifkan'); LU.reboot(); }).catch(function (e) { toast(e.message, 'e'); }); }); };
+  if ($('#mfon')) $('#mfon').onclick = function () { rpc('mfaSetup', {}).then(function (m) { LU.modal({ title: 'Aktifkan MFA', body: '<ol><li>Buka aplikasi authenticator (Google Authenticator, Microsoft Authenticator, Aegis, dll.).</li><li>' + (m.qr ? 'Pindai kode QR berikut, <b>atau</b> masukkan kunci manual (tipe berbasis waktu):' : 'Tambah akun → masukkan kunci manual berikut (tipe berbasis waktu):') + '</li></ol>' + (m.qr ? '<div style="text-align:center"><img alt="Kode QR MFA" id="mqr" src="' + esc(m.qr) + '" style="width:200px;height:200px;background:#fff;padding:8px;border-radius:8px"></div>' : '') + '<div class="card" style="font-family:monospace;word-break:break-all;font-size:16px">' + esc(m.secret.replace(/(.{4})/g, '$1 ')) + '</div><p><a href="' + esc(m.uri) + '">Buka langsung di aplikasi authenticator (perangkat ini)</a></p><label class="f"><span>Masukkan 6 digit kode dari aplikasi</span><input class="inp" id="mc" inputmode="numeric" maxlength="6"></label>', actions: [{ label: 'Verifikasi & aktifkan', cls: 'p', fn: function (c, w) { rpc('mfaEnable', { code: $('#mc', w).value }).then(function () { c(); toast('MFA aktif', 's'); LU.reboot(); }).catch(function (e) { toast(e.message, 'e'); }); } }] }); }); };
+  if ($('#mfoff')) $('#mfoff').onclick = function () { var sp = LU.MODE === 'supa'; LU.prompt('Nonaktifkan MFA', sp ? 'Masukkan kode 6 digit dari aplikasi authenticator' : 'Masukkan password Anda').then(function (pw) { if (pw) rpc('mfaDisable', sp ? { code: pw.trim() } : { password: pw }).then(function () { toast('MFA dinonaktifkan'); LU.reboot(); }).catch(function (e) { toast(e.message, 'e'); }); }); };
   $$('[data-th]').forEach(function (b) { b.onclick = function () { var my = LU.lsGet('theme', {}); my.theme = b.getAttribute('data-th') || undefined; if (!my.theme) { delete my.mode; delete my.accent; } LU.lsSet('theme', my); LU.applyTheme(); }; });
   $$('[data-md]').forEach(function (b) { b.onclick = function () { var my = LU.lsGet('theme', {}); my.mode = b.getAttribute('data-md'); LU.lsSet('theme', my); LU.applyTheme(); }; });
 };
@@ -3624,7 +3755,9 @@ LU.V.settings = function (main, p) {
   }
   if (tab === 'integr') {
     var sc = S.boot.secrets || {};
-    sb.innerHTML = admin ? '<div class="card"><h3>Kunci & token (' + (LU.MODE === 'supa' ? 'disimpan di database Supabase, tidak bisa dibaca browser' : 'disimpan di Script Properties, tidak pernah dikirim balik') + ')</h3><div class="tw"><table class="t">' + [['AI_PROVIDER', 'GEMINI / OPENAI / ANTHROPIC'], ['AI_API_KEY', 'Kunci API provider AI'], ['AI_MODEL', 'Nama model sesuai dokumentasi provider'], ['FONNTE_TOKEN', 'Token WhatsApp Fonnte'], ['ADAPTER_TOKEN', 'Token webhook worker fotogrametri'], ['WEATHER_API_KEY', 'Kunci langganan Open-Meteo (komersial)']].map(function (x) { return '<tr><td><b>' + x[0] + '</b><div class="sm muted">' + x[1] + '</div></td><td>' + (sc[x[0]] ? '<span class="chip c-ok">' + esc(sc[x[0]]) + '</span>' : '<span class="chip">kosong</span>') + '</td><td class="right"><button class="btn s" data-sec="' + x[0] + '">Ubah</button></td></tr>'; }).join('') + '</table></div>' + (LU.MODE === 'supa' ? '<p class="sm muted mt">Edisi Supabase: kunci dipakai Edge Function <b>langitukur-proxy</b> di server. Webhook worker fotogrametri (ADAPTER_TOKEN) untuk edisi Supabase menyusul di Tahap 3 — sementara status job diperbarui manual.</p>' : '<p class="sm muted mt">Webhook worker: POST ke URL Web App dengan body {"action":"adapterCallback","adapterToken":"…","payload":{"job_code":"JOB-…","status":"RUNNING|COMPLETED|FAILED","log":"…","outputs":[{"asset_type":"ORTHOMOSAIC","format":"COG","crs":"EPSG:32749","uri":"…","checksum":"…"}]}}</p>') + '</div>' : '<div class="al warn">Hanya admin.</div>';
+    sb.innerHTML = admin ? '<div class="card"><h3>Kunci & token (' + (LU.MODE === 'supa' ? 'disimpan di database Supabase, tidak bisa dibaca browser' : 'disimpan di Script Properties, tidak pernah dikirim balik') + ')</h3><div class="tw"><table class="t">' + [['AI_PROVIDER', 'GEMINI / OPENAI / ANTHROPIC'], ['AI_API_KEY', 'Kunci API provider AI'], ['AI_MODEL', 'Nama model sesuai dokumentasi provider'], ['FONNTE_TOKEN', 'Token WhatsApp Fonnte'], ['ADAPTER_TOKEN', 'Token webhook worker fotogrametri'], ['WEATHER_API_KEY', 'Kunci langganan Open-Meteo (komersial)']].map(function (x) { return '<tr><td><b>' + x[0] + '</b><div class="sm muted">' + x[1] + '</div></td><td>' + (sc[x[0]] ? '<span class="chip c-ok">' + esc(sc[x[0]]) + '</span>' : '<span class="chip">kosong</span>') + '</td><td class="right"><button class="btn s" data-sec="' + x[0] + '">Ubah</button></td></tr>'; }).join('') + '</table></div>' + (LU.MODE === 'supa' ? '<p class="sm muted mt">Edisi Supabase: kunci dipakai Edge Function <b>langitukur-proxy</b> di server.</p><div class="card mt" style="background:var(--bg2,transparent)"><h3>Webhook worker fotogrametri</h3><p class="sm">Worker (Metashape/WebODM/GDAL) melapor status job, log &amp; produk hasil ke alamat ini — tanpa login, cukup token:</p><div class="tw"><table class="t"><tr><td>Alamat (POST)</td><td style="word-break:break-all"><code id="whurl">' + esc(window.LU_SUPA.webhookUrl()) + '</code></td></tr><tr><td>Header</td><td style="word-break:break-all"><code>apikey: ' + esc(window.LU_SUPA.publicKey()) + '</code><br><code>Content-Type: application/json</code></td></tr><tr><td>Isi</td><td class="sm" style="word-break:break-all"><code>{"p_token":"luwh_…","p_payload":{"job_code":"JOB-…","status":"RUNNING|COMPLETED|FAILED","log":"…","outputs":[{"asset_type":"ORTHOMOSAIC","format":"COG","crs":"EPSG:32749","uri":"…"}]}}</code></td></tr></table></div><div class="row mt"><button class="btn p" id="whnew">' + ic('key') + 'Buat token webhook baru</button><button class="btn" id="whcopy">' + ic('copy') + 'Salin alamat</button></div><p class="sm muted">Token baru hanya ditampilkan sekali; token lama langsung tidak berlaku. Contoh skrip worker ada di paket (contoh_worker.py).</p></div>' : '<p class="sm muted mt">Webhook worker: POST ke URL Web App dengan body {"action":"adapterCallback","adapterToken":"…","payload":{"job_code":"JOB-…","status":"RUNNING|COMPLETED|FAILED","log":"…","outputs":[{"asset_type":"ORTHOMOSAIC","format":"COG","crs":"EPSG:32749","uri":"…","checksum":"…"}]}}</p>') + '</div>' : '<div class="al warn">Hanya admin.</div>';
+    if ($('#whcopy')) $('#whcopy').onclick = function () { try { navigator.clipboard.writeText($('#whurl').textContent).then(function () { toast('Alamat disalin', 's'); }); } catch (e) { toast('Salin manual dari tabel.'); } };
+    if ($('#whnew')) $('#whnew').onclick = function () { LU.confirm('Buat token webhook baru? Worker yang memakai token lama harus diperbarui.', 'Buat token').then(function (y) { if (!y) return; rpc('adapterTokenNew', {}).then(function (r) { LU.modal({ title: 'Token webhook baru', body: '<div class="al warn"><div>Salin & simpan sekarang — token ini <b>tidak ditampilkan lagi</b>.</div></div><div class="card" style="font-family:monospace;word-break:break-all;font-size:15px" id="whtok">' + esc(r.token) + '</div>', actions: [{ label: 'Salin token', icon: 'copy', fn: function () { try { navigator.clipboard.writeText(r.token); toast('Token disalin', 's'); } catch (e) { } } }, { label: 'Selesai', cls: 'p', fn: function (c) { c(); LU.go('settings', { tab: 'integr' }, { noPush: true }); } }] }); }).catch(function (e) { toast(e.message, 'e'); }); }); };
     $$('[data-sec]').forEach(function (bt) { bt.onclick = function () { LU.prompt('Ubah ' + bt.getAttribute('data-sec'), 'Nilai baru (kosongkan untuk menghapus)').then(function (v) { if (v === null) return; rpc('secretSave', { name: bt.getAttribute('data-sec'), value: v }).then(function () { toast('Tersimpan', 's'); LU.reboot(); }).catch(function (e) { toast(e.message, 'e'); }); }); }; });
   }
   if (tab === 'data') {
